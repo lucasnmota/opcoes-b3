@@ -1,7 +1,6 @@
 # app_opcoes.py
-# pip install streamlit pandas plotly requests
-# Rodar: streamlit run app_opcoes.py
-import io, os, zipfile, requests, urllib3
+# Rodar localmente: streamlit run app_opcoes.py
+import io, os, gc, zipfile, requests, urllib3
 from datetime import date, timedelta
 import pandas as pd
 import plotly.express as px
@@ -9,55 +8,86 @@ import streamlit as st
 
 urllib3.disable_warnings()
 st.set_page_config(page_title="Opções B3", page_icon="📈", layout="wide")
-HIST = "historico_opcoes.csv"
+HIST = "historico_opcoes.parquet"
 CORES = {"CALL": "#16a34a", "PUT": "#dc2626"}
+COLS = ["data", "codigo", "tipo", "fechamento", "negocios",
+        "contratos", "volume", "strike", "vencimento"]
 
-# ---------- Coleta de dados ----------
-def parse(txt):
-    reg = []
-    for l in txt.splitlines():
-        if l[:2] != "01" or l[24:27] not in ("070", "080"):
-            continue
-        reg.append({"data": l[2:10], "codigo": l[12:24].strip(),
-                    "tipo": "CALL" if l[24:27] == "070" else "PUT",
-                    "fechamento": int(l[108:121]) / 100, "negocios": int(l[147:152]),
-                    "contratos": int(l[152:170]), "volume": int(l[170:188]) / 100,
-                    "strike": int(l[188:201]) / 100, "vencimento": l[202:210]})
-    return pd.DataFrame(reg)
+# ---------- Coleta de dados (leitura em partes, pouca memória) ----------
+def otimizar(df):
+    df["data"] = pd.to_datetime(df["data"], format="%Y%m%d")
+    df["vencimento"] = pd.to_datetime(df["vencimento"], format="%Y%m%d", errors="coerce")
+    for c in ["fechamento", "volume", "strike"]:
+        df[c] = df[c].astype("float64")
+    for c in ["negocios", "contratos"]:
+        df[c] = df[c].astype("int64")
+    return df
 
-def baixar(nome):
+def ler_zip(conteudo, desde=None):
+    partes, reg = [], []
+    z = zipfile.ZipFile(io.BytesIO(conteudo))
+    with z.open(z.namelist()[0]) as f:
+        for l in f:
+            if l[:2] != b"01" or l[24:27] not in (b"070", b"080"):
+                continue
+            d = l[2:10].decode()
+            if desde and d < desde:
+                continue
+            reg.append((d, l[12:24].decode("latin-1").strip(),
+                        "CALL" if l[24:27] == b"070" else "PUT",
+                        int(l[108:121]) / 100, int(l[147:152]), int(l[152:170]),
+                        int(l[170:188]) / 100, int(l[188:201]) / 100, l[202:210].decode()))
+            if len(reg) >= 200_000:
+                partes.append(otimizar(pd.DataFrame(reg, columns=COLS)))
+                reg = []
+    if reg:
+        partes.append(otimizar(pd.DataFrame(reg, columns=COLS)))
+    return pd.concat(partes, ignore_index=True) if partes else None
+
+def baixar(nome, desde=None):
     url = f"https://bvmf.bmfbovespa.com.br/InstDados/SerHist/{nome}.ZIP"
-    r = requests.get(url, verify=False, timeout=180)
+    try:
+        r = requests.get(url, verify=False, timeout=300)
+    except requests.RequestException:
+        return None
     if r.status_code != 200 or not r.content.startswith(b"PK"):
         return None
-    z = zipfile.ZipFile(io.BytesIO(r.content))
-    return parse(z.read(z.namelist()[0]).decode("latin-1"))
+    df = ler_zip(r.content, desde)
+    del r
+    gc.collect()
+    return df
 
-def atualizar(carga_anual=False):
-    hist = pd.read_csv(HIST, dtype=str) if os.path.exists(HIST) else pd.DataFrame()
+def atualizar(meses, carga_anual=False):
+    hist = pd.read_parquet(HIST) if os.path.exists(HIST) else None
+    desde = (date.today() - timedelta(days=31 * meses)).strftime("%Y%m%d")
     novos = []
-    if carga_anual or hist.empty:
-        d = baixar(f"COTAHIST_A{date.today().year}")
-        if d is not None:
-            novos.append(d.astype(str))
-    salvas = set(hist["data"]) if not hist.empty else set()
+    if carga_anual or hist is None:
+        hoje = date.today()
+        anos = sorted({int(desde[:4]), hoje.year})
+        for ano in anos:
+            d = baixar(f"COTAHIST_A{ano}", desde)
+            if d is not None:
+                novos.append(d)
+    salvas = set(hist["data"].dt.strftime("%Y%m%d")) if hist is not None else set()
     for i in range(10, -1, -1):
         d = date.today() - timedelta(days=i)
         if d.weekday() < 5 and f"{d:%Y%m%d}" not in salvas:
             x = baixar(f"COTAHIST_D{d:%d%m%Y}")
             if x is not None and not x.empty:
-                novos.append(x.astype(str))
-    if novos:
-        hist = pd.concat([hist] + novos).drop_duplicates(["data", "codigo"], keep="last")
-        hist.to_csv(HIST, index=False)
+                novos.append(x)
+    if not novos:
+        return False
+    tudo = pd.concat(([hist] if hist is not None else []) + novos, ignore_index=True)
+    tudo = tudo.drop_duplicates(["data", "codigo"], keep="last")
+    tudo = tudo[tudo["data"] >= pd.Timestamp(desde)]
+    tudo.to_parquet(HIST, index=False)
+    del tudo, novos
+    gc.collect()
+    return True
 
 @st.cache_data
 def carregar(_mtime):
-    df = pd.read_csv(HIST, dtype=str)
-    for c in ["fechamento", "negocios", "contratos", "volume", "strike"]:
-        df[c] = pd.to_numeric(df[c])
-    df["data"] = pd.to_datetime(df["data"])
-    df["vencimento"] = pd.to_datetime(df["vencimento"])
+    df = pd.read_parquet(HIST)
     df["ativo"] = df["codigo"].str[:4]
     df["semana"] = df["data"].dt.to_period("W").dt.start_time
     df["mes"] = df["data"].dt.to_period("M").dt.start_time
@@ -73,17 +103,23 @@ def brl(v):
 
 # ---------- Barra lateral ----------
 st.sidebar.title("📈 Opções B3")
+meses = st.sidebar.slider("Meses de histórico", 1, 6, 3,
+                          help="Mais meses = mais dados, mas a carga fica mais lenta.")
 if st.sidebar.button("🔄 Atualizar dados da B3", use_container_width=True):
     with st.spinner("Baixando arquivos da B3..."):
-        atualizar()
+        ok = atualizar(meses)
     st.cache_data.clear()
-if st.sidebar.button("📦 Carga completa do ano", use_container_width=True):
-    with st.spinner("Baixando arquivo anual (pode demorar)..."):
-        atualizar(carga_anual=True)
+    if not ok:
+        st.sidebar.warning("Nenhum arquivo novo encontrado na B3.")
+if st.sidebar.button("📦 Carga completa", use_container_width=True):
+    with st.spinner("Baixando histórico da B3 (pode levar alguns minutos)..."):
+        ok = atualizar(meses, carga_anual=True)
     st.cache_data.clear()
+    if not ok:
+        st.sidebar.error("Não consegui baixar os arquivos da B3. Tente de novo em alguns minutos.")
 
 if not os.path.exists(HIST):
-    st.info("Nenhum dado ainda. Clique em **Carga completa do ano** na barra lateral.")
+    st.info("Nenhum dado ainda. Clique em **Carga completa** na barra lateral.")
     st.stop()
 
 df = carregar(os.path.getmtime(HIST))
@@ -91,7 +127,9 @@ ultimo = df["data"].max()
 ativos_rank = df.groupby("ativo")["volume"].sum().sort_values(ascending=False)
 ativo = st.sidebar.selectbox("Ativo-objeto", ativos_rank.index.tolist())
 top = st.sidebar.slider("Top N opções", 5, 30, 10)
-ini, fim = st.sidebar.date_input("Período", (df.data.min().date(), ultimo.date()))
+periodo = st.sidebar.date_input("Período", (df.data.min().date(), ultimo.date()))
+ini, fim = (periodo if isinstance(periodo, (list, tuple)) and len(periodo) == 2
+            else (df.data.min().date(), ultimo.date()))
 st.sidebar.markdown("---\n**Alertas**")
 multiplo = st.sidebar.number_input("Múltiplo da média", 1.5, 20.0, 3.0, 0.5)
 vol_min = st.sidebar.number_input("Volume mínimo (R$)", 0, 50_000_000, 500_000, 100_000)
@@ -127,7 +165,7 @@ with aba1:
     st.dataframe(ranking(df[df.data == ultimo], top), use_container_width=True, hide_index=True)
 
 with aba2:
-    vencs = sorted(a.vencimento.unique())
+    vencs = sorted(a.vencimento.dropna().unique())
     if vencs:
         futuros = [v for v in vencs if v >= ultimo]
         padrao = vencs.index(futuros[0]) if futuros else len(vencs) - 1
