@@ -115,10 +115,14 @@ def brl(v, casas=0):
     return f"R$ {s}"
 
 # ---------- Matemática das estratégias ----------
-_erf = np.vectorize(math.erf)
-
 def ncdf(x):
-    return 0.5 * (1 + _erf(np.asarray(x, float) / math.sqrt(2)))
+    """Distribuição normal acumulada (aproximação vetorizada, erro < 1e-7)."""
+    x = np.asarray(x, float)
+    z = np.abs(x) / math.sqrt(2)
+    t = 1 / (1 + 0.3275911 * z)
+    y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+             + 0.254829592) * t * np.exp(-z * z)
+    return 0.5 * (1 + np.sign(x) * y)
 
 def bs(S, K, T, r, vol, tipo):
     """Preço teórico Black-Scholes (aproximação europeia)."""
@@ -513,9 +517,9 @@ k4.metric("Put/Call ratio", num(vp / vc) if vc else "–")
 if q:
     st.caption(f"Cotação: {q['fonte']} • {texto_hora(q)}")
 
-(aba1, aba_pc, aba2, aba3, aba4, aba5, aba_sim, aba_acomp) = st.tabs(
+(aba1, aba_pc, aba2, aba3, aba4, aba5, aba_q, aba_sim, aba_acomp) = st.tabs(
     ["📊 Visão geral", "⚖️ Put/Call", "📅 Por vencimento", "🗓️ Semanal", "📆 Mensal",
-     "🚨 Alertas", "🧮 Simulador", "📒 Minhas estratégias"])
+     "🚨 Alertas", "🔬 Quant", "🧮 Simulador", "📒 Minhas estratégias"])
 
 with aba1:
     c1, c2 = st.columns(2)
@@ -850,3 +854,452 @@ with aba_acomp:
                     st.session_state.estrategias = [x for x in ests if x["id"] != e["id"]]
                     salvar_est()
                     st.rerun()
+
+# ---------- Análises quantitativas ----------
+def bs_vec(S, K, T, r, vol, call):
+    """Black-Scholes vetorizado. Devolve (preço, d1)."""
+    raiz = vol * np.sqrt(T)
+    d1 = (np.log(S / K) + (r + vol ** 2 / 2) * T) / raiz
+    d2 = d1 - raiz
+    desc = np.exp(-r * T)
+    c = S * ncdf(d1) - K * desc * ncdf(d2)
+    p = K * desc * ncdf(-d2) - S * ncdf(-d1)
+    return np.where(call, c, p), d1
+
+def iv_vec(preco, S, K, T, r, call, it=50):
+    """Volatilidade implícita por bisseção, para milhares de opções de uma vez."""
+    n = len(preco)
+    lo, hi = np.full(n, 0.01), np.full(n, 3.0)
+    for _ in range(it):
+        mid = (lo + hi) / 2
+        alto = bs_vec(S, K, T, r, mid, call)[0] > preco
+        hi, lo = np.where(alto, mid, hi), np.where(alto, lo, mid)
+    vmin = bs_vec(S, K, T, r, np.full(n, 0.011), call)[0]
+    vmax = bs_vec(S, K, T, r, np.full(n, 2.99), call)[0]
+    return np.where((preco > vmin) & (preco < vmax), (lo + hi) / 2, np.nan)
+
+@st.cache_data(show_spinner="Calculando volatilidade implícita...")
+def base_quant(versao, raiz, tk, r):
+    sp = acoes[acoes.codigo == tk][["data", "fechamento"]].rename(columns={"fechamento": "spot"})
+    o = df[df.ativo == raiz][["data", "codigo", "tipo", "strike", "vencimento", "fechamento",
+                              "volume", "contratos", "negocios"]].merge(sp, on="data")
+    o = o.dropna(subset=["vencimento"])
+    o = o[(o.strike > 0) & (o.fechamento > 0) & (o.spot > 0)].copy()
+    if o.empty:
+        return o, pd.DataFrame()
+    o["du"] = np.busday_count(o.data.values.astype("datetime64[D]"),
+                              o.vencimento.values.astype("datetime64[D]"))
+    o = o[o.du > 0].copy()
+    o["T"] = o.du / 252
+    call = (o.tipo == "CALL").to_numpy()
+    o["iv"] = iv_vec(o.fechamento.to_numpy(), o.spot.to_numpy(), o.strike.to_numpy(),
+                     o["T"].to_numpy(), r, call)
+    # Série diária de IV: opções perto do dinheiro, 5 a 70 dias úteis, com liquidez
+    mon = (o.strike / o.spot - 1).abs()
+    b = o[o.iv.between(0.03, 2.5) & (mon <= 0.12) & o.du.between(5, 70) & (o.negocios >= 3)].copy()
+    b["w"] = b.volume * np.exp(-((b.strike / b.spot - 1) / 0.04) ** 2)
+    b["wiv"] = b.w * b.iv
+    def media_pond(x):
+        s = x.groupby("data")[["wiv", "w"]].sum()
+        return s.wiv / s.w.replace(0, np.nan)
+    serie = pd.DataFrame({"IV": media_pond(b), "IV calls": media_pond(b[b.tipo == "CALL"]),
+                          "IV puts": media_pond(b[b.tipo == "PUT"])}).dropna(subset=["IV"])
+    # Pressão compradora/vendedora estimada: variação do prêmio além do que o delta explica
+    iv_dia = serie["IV"].reindex(o.data).to_numpy()
+    vol_d = np.where(np.isnan(iv_dia), 0.35, iv_dia)
+    d1 = bs_vec(o.spot.to_numpy(), o.strike.to_numpy(), o["T"].to_numpy(), r, vol_d, call)[1]
+    o["delta"] = np.where(call, ncdf(d1), ncdf(d1) - 1)
+    o = o.sort_values(["codigo", "data"])
+    g = o.groupby("codigo")
+    resid = (o.fechamento - g.fechamento.shift()) - o.delta * (o.spot - g.spot.shift())
+    o["pressao"] = np.sign(resid).fillna(0) * o.volume
+    return o, serie
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def hist_yahoo(tk):
+    try:
+        import yfinance as yf
+        h = yf.Ticker(f"{tk}.SA").history(period="2y", interval="1d", auto_adjust=False)
+        if h.empty or len(h) < 30:
+            return None
+        h.index = pd.to_datetime(h.index).tz_localize(None).normalize()
+        aj = h["Adj Close"] if "Adj Close" in h else h["Close"]
+        return h["Close"].astype(float), aj.astype(float)
+    except Exception:
+        return None
+
+def historico_precos(tk):
+    y = hist_yahoo(tk)
+    if y is not None:
+        return y[0], y[1], "Yahoo Finance, 2 anos"
+    x = acoes[acoes.codigo == tk].set_index("data")["fechamento"].sort_index()
+    return x, x, "COTAHIST B3"
+
+@st.cache_data(show_spinner="Rodando simulações...")
+def monte_carlo(S0, sigma, mu, dias, n, metodo, rets, seed):
+    rng = np.random.default_rng(seed)
+    dt = 1 / 252
+    if metodo == "Bootstrap" and len(rets) > 20:
+        base = rets - rets.mean()
+        lr = rng.choice(base, size=(n, dias)).astype(np.float32) + np.float32(mu * dt)
+    else:
+        z = rng.standard_normal((n, dias), dtype=np.float32)
+        lr = np.float32((mu - 0.5 * sigma ** 2) * dt) + np.float32(sigma * math.sqrt(dt)) * z
+    return (S0 * np.exp(np.cumsum(lr, axis=1))).astype(np.float32)
+
+def max_pain(f):
+    """Strike em que o total pago aos titulares das opções seria mínimo (aproximação)."""
+    ks = np.sort(f.strike.unique())
+    if len(ks) == 0:
+        return None
+    c = f[f.tipo == "CALL"].groupby("strike").contratos.sum()
+    p = f[f.tipo == "PUT"].groupby("strike").contratos.sum()
+    custo = [(c * np.maximum(P - c.index, 0)).sum() + (p * np.maximum(p.index - P, 0)).sum()
+             for P in ks]
+    return float(ks[int(np.argmin(custo))])
+
+with aba_q:
+    st.caption("Ferramentas estatísticas para estudo. Não são recomendação de investimento: "
+               "os níveis e probabilidades são estimativas baseadas no histórico.")
+    o_q, serie_iv = base_quant(os.path.getmtime(HIST), ativo, ticker, round(r_cont, 6))
+    fech, ajust, fonte_h = historico_precos(ticker)
+    rets = np.log(ajust).diff().dropna()
+    S_now = float(q["preco"]) if q else (float(fech.iloc[-1]) if len(fech) else None)
+    if not S_now:
+        st.warning(f"Não encontrei preços de {ticker}. Clique em **📦 Carga completa**.")
+        st.stop()
+
+    def hv(h):
+        return float(rets.tail(h).std() * math.sqrt(252)) if len(rets) >= h else np.nan
+
+    # ===== 1. IV e IV Rank =====
+    st.subheader("1. Volatilidade implícita e IV Rank")
+    if serie_iv.empty:
+        st.info(f"Para calcular a IV preciso do preço à vista de {ticker} em cada pregão do "
+                "histórico. Clique em **📦 Carga completa** na barra lateral.")
+        iv_now = np.nan
+    else:
+        n_iv = len(serie_iv)
+        look = (st.slider("Janela do IV Rank (pregões)", 10, n_iv, n_iv) if n_iv > 10 else n_iv)
+        s = serie_iv["IV"].tail(look)
+        iv_now = float(s.iloc[-1])
+        ivr = (iv_now - s.min()) / (s.max() - s.min()) * 100 if s.max() > s.min() else np.nan
+        ivp = (s < iv_now).mean() * 100
+        hv21 = hv(21)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("IV atual", f"{num(iv_now * 100, 1)}%",
+                  help="Média ponderada por volume das opções perto do dinheiro, de 5 a 70 dias úteis.")
+        m2.metric("IV Rank", f"{ivr:.0f}" if pd.notna(ivr) else "–",
+                  help="Onde a IV atual está entre a mínima (0) e a máxima (100) da janela.")
+        m3.metric("IV Percentil", f"{ivp:.0f}%",
+                  help="Em quantos % dos pregões da janela a IV ficou abaixo da atual.")
+        m4.metric("IV ÷ Vol. histórica 30d", num(iv_now / hv21) if hv21 else "–",
+                  help="Acima de 1: o mercado precifica mais oscilação do que a ação vem tendo.")
+        if pd.notna(ivr):
+            if ivr >= 70:
+                st.warning(f"IV Rank alto ({ivr:.0f}): opções **caras** em relação ao histórico. "
+                           "Costuma favorecer estratégias vendidas, como Iron Condor, venda "
+                           "coberta e travas de crédito.")
+            elif ivr <= 30:
+                st.success(f"IV Rank baixo ({ivr:.0f}): opções **baratas** em relação ao histórico. "
+                           "Costuma favorecer compra de opções, travas de débito e straddles.")
+            else:
+                st.caption(f"IV Rank intermediário ({ivr:.0f}).")
+        hv_roll = (rets.rolling(21).std() * math.sqrt(252)).reindex(serie_iv.index)
+        fiv = go.Figure()
+        for col, cor, traco in [("IV", "#111827", None), ("IV calls", CORES["CALL"], "dot"),
+                                ("IV puts", CORES["PUT"], "dot")]:
+            fiv.add_trace(go.Scatter(x=serie_iv.index, y=serie_iv[col] * 100, name=col,
+                                     line=dict(color=cor, dash=traco, width=2 if col == "IV" else 1)))
+        fiv.add_trace(go.Scatter(x=hv_roll.index, y=hv_roll * 100, name="Vol. histórica 30d",
+                                 line=dict(color="#2563eb", dash="dash")))
+        fiv.update_layout(title=f"Volatilidade implícita x histórica – {ticker}",
+                          yaxis_title="% ao ano", hovermode="x unified", yaxis_tickformat=".1f")
+        grafico(st, fiv)
+        if n_iv < 200:
+            st.caption(f"O IV Rank clássico usa 1 ano (~252 pregões). Aqui há {n_iv} pregões de "
+                       "opções carregados; aumente **Meses de histórico** pra uma leitura mais "
+                       "robusta.")
+
+    # ===== 2. Desvio padrão por horizonte =====
+    st.subheader("2. Desvio padrão e volatilidade histórica")
+    JANELAS = {"1 semana": 5, "30 dias": 21, "3 meses": 63, "6 meses": 126, "1 ano": 252}
+    j1, j2 = st.columns([3, 1])
+    sel = j1.multiselect("Horizontes", list(JANELAS) + ["Personalizado"],
+                         default=["1 semana", "30 dias", "3 meses"])
+    hz = {k: JANELAS[k] for k in sel if k in JANELAS}
+    if "Personalizado" in sel:
+        hpers = j2.number_input("Pregões (personalizado)", 2, 500, 42)
+        hz[f"{hpers} pregões"] = int(hpers)
+    linhas_dp = []
+    for nome_h, h in hz.items():
+        if len(fech) <= h:
+            continue
+        vol_a = hv(h)
+        janela_px = fech.tail(h)
+        mov = S_now * vol_a * math.sqrt(h / 252)
+        linhas_dp.append({
+            "Horizonte": nome_h, "Pregões": h, "Vol. histórica (% a.a.)": vol_a * 100,
+            "Desvio padrão dos fechamentos (R$)": float(janela_px.std()),
+            "Média dos fechamentos (R$)": float(janela_px.mean()),
+            "Retorno no período (%)": float((fech.iloc[-1] / fech.iloc[-h - 1] - 1) * 100),
+            "Movimento esperado 1σ (R$)": mov,
+            "Faixa 1σ (68%)": f"R$ {num(S_now - mov)} a R$ {num(S_now + mov)}",
+            "Faixa 2σ (95%)": f"R$ {num(max(S_now - 2 * mov, 0))} a R$ {num(S_now + 2 * mov)}"})
+    if linhas_dp:
+        st.dataframe(pd.DataFrame(linhas_dp), width="stretch", hide_index=True, column_config={
+            "Vol. histórica (% a.a.)": st.column_config.NumberColumn(format="%.1f%%"),
+            "Desvio padrão dos fechamentos (R$)": st.column_config.NumberColumn(format="%.2f"),
+            "Média dos fechamentos (R$)": st.column_config.NumberColumn(format="%.2f"),
+            "Retorno no período (%)": st.column_config.NumberColumn(format="%+.1f%%"),
+            "Movimento esperado 1σ (R$)": st.column_config.NumberColumn(format="%.2f")})
+        st.caption(f"Preços: {fonte_h}. O movimento esperado projeta a volatilidade histórica "
+                   "do horizonte a partir da cotação atual.")
+        h_graf = st.radio("Bandas no gráfico", list(hz), horizontal=True, index=min(1, len(hz) - 1))
+        h = hz[h_graf]
+        base_px = fech.tail(252 + h)
+        mmv, dpv = base_px.rolling(h).mean(), base_px.rolling(h).std()
+        base_px, mmv, dpv = base_px.tail(252), mmv.tail(252), dpv.tail(252)
+        fdp = go.Figure()
+        for k, alfa in [(2, 0.08), (1, 0.16)]:
+            fdp.add_trace(go.Scatter(x=mmv.index, y=mmv + k * dpv, line=dict(width=0),
+                                     showlegend=False, hoverinfo="skip"))
+            fdp.add_trace(go.Scatter(x=mmv.index, y=mmv - k * dpv, line=dict(width=0),
+                                     fill="tonexty", fillcolor=f"rgba(37,99,235,{alfa})",
+                                     name=f"Média ± {k}σ", hoverinfo="skip"))
+        fdp.add_trace(go.Scatter(x=base_px.index, y=base_px, name="Fechamento",
+                                 line=dict(color="#111827", width=2)))
+        fdp.add_trace(go.Scatter(x=mmv.index, y=mmv, name=f"Média {h}",
+                                 line=dict(color="#2563eb", dash="dash")))
+        # Cone de projeção para o horizonte escolhido
+        vol_h = hv(h)
+        futuro = pd.bdate_range(base_px.index[-1], periods=h + 1)
+        tt = np.arange(h + 1) / 252
+        for k, cor in [(1, "rgba(245,158,11,0.9)"), (2, "rgba(245,158,11,0.5)")]:
+            for sg in (1, -1):
+                fdp.add_trace(go.Scatter(x=futuro, y=S_now * np.exp(sg * k * vol_h * np.sqrt(tt)),
+                                         line=dict(color=cor, dash="dot"), hoverinfo="skip",
+                                         name=f"Projeção ±{k}σ", showlegend=sg == 1))
+        fdp.update_layout(title=f"{ticker} – fechamentos com bandas de desvio padrão ({h_graf})",
+                          yaxis_title="R$", hovermode="x unified", yaxis_tickformat=",.2f")
+        grafico(st, fdp, 480)
+    else:
+        st.info("Histórico de preços insuficiente para os horizontes escolhidos.")
+
+    # ===== 3. Suportes e resistências pelo fluxo de opções =====
+    st.subheader("3. Suportes e resistências pelo fluxo de opções")
+    res_wall = sup_wall = mp = None
+    if o_q.empty:
+        st.info("Sem dados de opções com preço à vista para esse ativo.")
+    else:
+        vencs_q = sorted(o_q[o_q.vencimento >= ultimo].vencimento.unique())
+        f1, f2 = st.columns([2, 1])
+        vsel_q = f1.multiselect("Vencimentos", vencs_q, default=vencs_q[:1],
+                                format_func=lambda x: pd.Timestamp(x).strftime("%d/%m/%Y"))
+        npreg = f2.slider("Negociações dos últimos N pregões", 1, 60, 10)
+        datas_q = sorted(o_q.data.unique())[-npreg:]
+        f = o_q[o_q.vencimento.isin(vsel_q) & o_q.data.isin(datas_q)]
+        f = f[(f.strike > S_now * 0.6) & (f.strike < S_now * 1.4)]
+        if f.empty:
+            st.info("Sem negócios nesses vencimentos e período.")
+        else:
+            pv = (f.pivot_table(index="strike", columns="tipo", values="contratos", aggfunc="sum")
+                    .reindex(columns=["CALL", "PUT"]).fillna(0))
+            pr = (f.pivot_table(index="strike", columns="tipo", values="pressao", aggfunc="sum")
+                    .reindex(columns=["CALL", "PUT"]).fillna(0))
+            acima, abaixo = pv[pv.index > S_now], pv[pv.index < S_now]
+            res_wall = float(acima.CALL.idxmax()) if not acima.empty and acima.CALL.max() > 0 else None
+            sup_wall = float(abaixo.PUT.idxmax()) if not abaixo.empty and abaixo.PUT.max() > 0 else None
+            mp = max_pain(f)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Cotação", f"R$ {num(S_now)}")
+            m2.metric("Resistência (muro de calls)", f"R$ {num(res_wall)}" if res_wall else "–",
+                      f"{num((res_wall / S_now - 1) * 100, 1)}%" if res_wall else None,
+                      help="Strike acima da cotação com mais contratos de call negociados.")
+            m3.metric("Suporte (muro de puts)", f"R$ {num(sup_wall)}" if sup_wall else "–",
+                      f"{num((sup_wall / S_now - 1) * 100, 1)}%" if sup_wall else None,
+                      help="Strike abaixo da cotação com mais contratos de put negociados.")
+            m4.metric("Max pain (aprox.)", f"R$ {num(mp)}" if mp else "–",
+                      help="Preço no vencimento em que os titulares das opções receberiam menos. "
+                           "Aproximado pelos contratos negociados, já que a B3 não traz o "
+                           "contrato em aberto no arquivo histórico.")
+
+            fw = go.Figure()
+            fw.add_trace(go.Bar(y=pv.index, x=pv.CALL, orientation="h", name="Calls",
+                                marker_color=CORES["CALL"]))
+            fw.add_trace(go.Bar(y=pv.index, x=-pv.PUT, orientation="h", name="Puts",
+                                marker_color=CORES["PUT"], customdata=pv.PUT,
+                                hovertemplate="Strike %{y}<br>Puts: %{customdata:,.0f}<extra></extra>"))
+            fw.add_hline(y=S_now, line_color="#111827", line_dash="dot",
+                         annotation_text=f"Cotação {num(S_now)}")
+            if res_wall:
+                fw.add_hline(y=res_wall, line_color=CORES["CALL"], annotation_text="Resistência")
+            if sup_wall:
+                fw.add_hline(y=sup_wall, line_color=CORES["PUT"], annotation_text="Suporte")
+            fw.update_layout(barmode="relative", title="Contratos negociados por strike "
+                             "(puts à esquerda, calls à direita)", yaxis_title="Strike (R$)",
+                             xaxis_title="Contratos")
+            grafico(st, fw, 600)
+
+            fpz = go.Figure()
+            for tp in ["CALL", "PUT"]:
+                fpz.add_trace(go.Bar(x=pr.index, y=pr[tp], name=f"{tp}s",
+                                     marker_color=CORES[tp]))
+            fpz.add_vline(x=S_now, line_dash="dot", line_color="#111827")
+            fpz.update_layout(barmode="group", title="Pressão estimada: acima de zero = mais "
+                              "compra, abaixo de zero = mais venda", xaxis_title="Strike (R$)",
+                              yaxis_title="Volume líquido estimado (R$)")
+            grafico(st, fpz)
+
+            leitura = []
+            if res_wall:
+                pc = pr.CALL.get(res_wall, 0)
+                leitura.append(f"**Resistência em R$ {num(res_wall)}:** " + (
+                    "predomínio estimado de **venda de calls**. Vendedores apostam que o preço "
+                    "não passa desse nível, o que reforça a resistência." if pc < 0 else
+                    "predomínio estimado de **compra de calls**. Há aposta em rompimento, então "
+                    "a resistência pode ser mais fraca."))
+            if sup_wall:
+                pp = pr.PUT.get(sup_wall, 0)
+                leitura.append(f"**Suporte em R$ {num(sup_wall)}:** " + (
+                    "predomínio estimado de **venda de puts**. Vendedores aceitam comprar a ação "
+                    "nesse preço, o que reforça o suporte." if pp < 0 else
+                    "predomínio estimado de **compra de puts**. É procura por proteção nesse "
+                    "nível; se for rompido, pode acelerar a queda."))
+            for t_ in leitura:
+                st.markdown(t_)
+            niveis = pd.DataFrame({
+                "Strike": pv.index, "Calls (contratos)": pv.CALL.values,
+                "Puts (contratos)": pv.PUT.values,
+                "Pressão calls (R$)": pr.CALL.reindex(pv.index).values,
+                "Pressão puts (R$)": pr.PUT.reindex(pv.index).values})
+            niveis["Total"] = niveis["Calls (contratos)"] + niveis["Puts (contratos)"]
+            with st.expander("Ver tabela completa por strike"):
+                st.dataframe(niveis.sort_values("Total", ascending=False), width="stretch",
+                             hide_index=True, column_config={
+                                 "Strike": st.column_config.NumberColumn(format="%.2f"),
+                                 "Calls (contratos)": st.column_config.NumberColumn(format="localized"),
+                                 "Puts (contratos)": st.column_config.NumberColumn(format="localized"),
+                                 "Total": st.column_config.NumberColumn(format="localized"),
+                                 "Pressão calls (R$)": st.column_config.NumberColumn(format="compact"),
+                                 "Pressão puts (R$)": st.column_config.NumberColumn(format="compact")})
+            st.caption("Como a pressão é estimada: para cada opção e pregão, comparo a variação do "
+                       "prêmio com o que o delta explicaria pela variação da ação. Se o prêmio subiu "
+                       "mais que o esperado, conto o volume como compra; se subiu menos, como venda. "
+                       "O arquivo da B3 não informa quem foi o agressor, então é uma aproximação.")
+
+    # ===== 4. Monte Carlo =====
+    st.subheader("4. Simulação de Monte Carlo")
+    c = st.columns(4)
+    dias_mc = c[0].number_input("Horizonte (dias úteis)", 1, 252, int(max(dias, 1)),
+                                help="Por padrão, o prazo do simulador de estratégias.")
+    n_sim = c[1].select_slider("Simulações", [1000, 5000, 10000, 20000], 10000)
+    metodo = c[2].selectbox("Modelo", ["Normal (GBM)", "Bootstrap"],
+                            help="Bootstrap sorteia retornos diários reais do histórico, o que "
+                                 "preserva caudas gordas e dias extremos.")
+    seed = c[3].number_input("Semente", 0, 999999, 42, help="Mesma semente = mesmo resultado.")
+    c2 = st.columns(4)
+    fontes_vol = {"IV atual": iv_now, "Vol. histórica 30 dias": hv(21),
+                  "Vol. histórica 3 meses": hv(63), "Vol. histórica 1 ano": hv(252)}
+    opcoes_vol = [k for k, v in fontes_vol.items() if pd.notna(v)] + ["Manual"]
+    fonte_vol = c2[0].selectbox("Volatilidade", opcoes_vol, disabled=metodo == "Bootstrap")
+    vol_manual = c2[1].number_input("Vol. manual (% a.a.)", 1.0, 300.0, 35.0, 1.0,
+                                    disabled=fonte_vol != "Manual")
+    sigma = vol_manual / 100 if fonte_vol == "Manual" else float(fontes_vol[fonte_vol])
+    tend = c2[2].selectbox("Tendência", ["Neutra (taxa de juros)", "Zero", "Histórica (1 ano)"])
+    mu = {"Neutra (taxa de juros)": r_cont, "Zero": 0.0,
+          "Histórica (1 ano)": float(rets.tail(252).mean() * 252) if len(rets) else 0.0}[tend]
+    extras_txt = c2[3].text_input("Níveis extras (R$)", "",
+                                  help="Preços separados por ponto e vírgula, ex.: 30; 35,5")
+
+    caminhos = monte_carlo(round(S_now, 4), round(sigma, 6), round(mu, 6), int(dias_mc),
+                           int(n_sim), "Bootstrap" if metodo == "Bootstrap" else "GBM",
+                           rets.to_numpy(dtype=float), int(seed))
+    final = caminhos[:, -1].astype(float)
+    st.caption(f"{n_sim:,} simulações • {dias_mc} dias úteis • ".replace(",", ".") +
+               (f"volatilidade {num(sigma * 100, 1)}% a.a." if metodo != "Bootstrap"
+                else f"retornos sorteados do histórico ({fonte_h})") +
+               f" • tendência {num(mu * 100, 1)}% a.a.")
+
+    pcts = [5, 25, 50, 75, 95]
+    faixas = np.percentile(caminhos, pcts, axis=0)
+    eixo = pd.bdate_range(pd.Timestamp(date.today()), periods=dias_mc + 1)[1:]
+    ffan = go.Figure()
+    for i_c in range(min(40, n_sim)):
+        ffan.add_trace(go.Scatter(x=eixo, y=caminhos[i_c], line=dict(width=0.6, color="rgba(148,163,184,0.35)"),
+                                  showlegend=False, hoverinfo="skip"))
+    for (lo_i, hi_i), alfa, nm in [((0, 4), 0.15, "90% dos cenários"), ((1, 3), 0.3, "50% dos cenários")]:
+        ffan.add_trace(go.Scatter(x=eixo, y=faixas[hi_i], line=dict(width=0), showlegend=False,
+                                  hoverinfo="skip"))
+        ffan.add_trace(go.Scatter(x=eixo, y=faixas[lo_i], line=dict(width=0), fill="tonexty",
+                                  fillcolor=f"rgba(37,99,235,{alfa})", name=nm))
+    ffan.add_trace(go.Scatter(x=eixo, y=faixas[2], name="Mediana", line=dict(color="#2563eb", width=2)))
+    for nv, cor, nm in [(res_wall, CORES["CALL"], "Resistência"), (sup_wall, CORES["PUT"], "Suporte")]:
+        if nv:
+            ffan.add_hline(y=nv, line_color=cor, line_dash="dash", annotation_text=nm)
+    ffan.update_layout(title="Leque de cenários simulados", yaxis_title="R$",
+                       hovermode="x unified", yaxis_tickformat=",.2f")
+    g1, g2 = st.columns(2)
+    grafico(g1, ffan)
+    fh = go.Figure(go.Histogram(x=final, nbinsx=80, marker_color="#94a3b8", name="Cenários"))
+    fh.add_vline(x=S_now, line_color="#111827", line_dash="dot", annotation_text="Hoje")
+    for nv, cor in [(res_wall, CORES["CALL"]), (sup_wall, CORES["PUT"])]:
+        if nv:
+            fh.add_vline(x=nv, line_color=cor, line_dash="dash")
+    fh.update_layout(title=f"Distribuição do preço em {dias_mc} dias úteis", xaxis_title="R$",
+                     yaxis_title="Cenários", showlegend=False, xaxis_tickformat=",.2f")
+    grafico(g2, fh)
+
+    mov1 = S_now * sigma * math.sqrt(dias_mc / 252)
+    niveis_mc = [("Suporte (muro de puts)", sup_wall), ("Resistência (muro de calls)", res_wall),
+                 ("Max pain", mp), ("-1σ", S_now - mov1), ("+1σ", S_now + mov1),
+                 ("-2σ", S_now - 2 * mov1), ("+2σ", S_now + 2 * mov1)]
+    for parte in extras_txt.split(";"):
+        try:
+            niveis_mc.append(("Nível extra", float(parte.strip().replace(",", "."))))
+        except ValueError:
+            pass
+    maxs, mins = caminhos.max(axis=1), caminhos.min(axis=1)
+    prob = []
+    for nm, nv in niveis_mc:
+        if not nv or nv <= 0:
+            continue
+        toca = (maxs >= nv) if nv >= S_now else (mins <= nv)
+        prob.append({"Nível": nm, "Preço (R$)": nv, "Distância (%)": (nv / S_now - 1) * 100,
+                     "Fechar acima (%)": (final > nv).mean() * 100,
+                     "Fechar abaixo (%)": (final < nv).mean() * 100,
+                     "Tocar no caminho (%)": toca.mean() * 100})
+    t1, t2 = st.columns([3, 1])
+    t1.markdown("**Probabilidades por nível**")
+    t1.dataframe(pd.DataFrame(prob).sort_values("Preço (R$)"), width="stretch", hide_index=True,
+                 column_config={
+                     "Preço (R$)": st.column_config.NumberColumn(format="%.2f"),
+                     "Distância (%)": st.column_config.NumberColumn(format="%+.1f%%"),
+                     "Fechar acima (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                     "Fechar abaixo (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                     "Tocar no caminho (%)": st.column_config.NumberColumn(format="%.1f%%")})
+    t2.markdown("**Faixas de preço final**")
+    t2.dataframe(pd.DataFrame({"Percentil": [f"{p_}%" for p_ in pcts],
+                               "Preço (R$)": np.percentile(final, pcts)}),
+                 width="stretch", hide_index=True,
+                 column_config={"Preço (R$)": st.column_config.NumberColumn(format="%.2f")})
+
+    if not pernas.empty:
+        st.markdown(f"**Estratégia do simulador no Monte Carlo:** {preset}")
+        pl_mc = resultado(final, pernas)
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Probabilidade de lucro", f"{num((pl_mc > 0).mean() * 100, 1)}%")
+        e2.metric("Resultado médio", brl(pl_mc.mean(), 2))
+        e3.metric("Pior 5% (VaR)", brl(np.percentile(pl_mc, 5), 2))
+        e4.metric("Melhor 5%", brl(np.percentile(pl_mc, 95), 2))
+        fpl = go.Figure(go.Histogram(x=pl_mc, nbinsx=80, marker_color="#2563eb"))
+        fpl.add_vline(x=0, line_color="#111827")
+        fpl.update_layout(title="Distribuição do resultado da estratégia no vencimento",
+                          xaxis_title="Resultado (R$)", yaxis_title="Cenários", showlegend=False,
+                          xaxis_tickformat=",.0f")
+        grafico(st, fpl)
+        if dias_mc != dias:
+            st.caption(f"O horizonte da simulação ({dias_mc} d.u.) é diferente do prazo do "
+                       f"simulador ({dias} d.u.). O resultado considera o payoff no vencimento.")
+    else:
+        st.caption("Monte uma estratégia no **🧮 Simulador** pra ver a probabilidade de lucro dela aqui.")
