@@ -305,7 +305,8 @@ def grafico_payoff(pernas, S0, T=0.0, r=0.0, vol=0.0, titulo="Payoff da estraté
     fig.add_hline(y=0, line_color="gray", line_width=1)
     fig.add_vline(x=S0, line_dash="dot", line_color="gray", annotation_text="Preço atual")
     fig.update_layout(title=titulo, xaxis_title="Preço do ativo (R$)",
-                      yaxis_title="Resultado (R$)", hovermode="x unified", height=480)
+                      yaxis_title="Resultado (R$)", hovermode="x unified",
+                      xaxis_tickformat=",.2f", yaxis_tickformat=",.0f")
     return fig
 
 # ---------- Estratégias salvas ----------
@@ -326,17 +327,106 @@ if "pernas" not in st.session_state:
     st.session_state.pernas = limpar(pd.DataFrame(columns=COLS_P))
     st.session_state.ed_v = 0
 
+# ---------- Formatação ----------
+def num(v, casas=2):
+    return f"{v:,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def brl_c(v):
+    """Valor em reais no formato curto: R$ 12,65 bi, R$ 3,4 mi..."""
+    a = abs(v)
+    for lim, suf in [(1e9, "bi"), (1e6, "mi"), (1e3, "mil")]:
+        if a >= lim:
+            return f"R$ {num(v / lim, 2)} {suf}"
+    return f"R$ {num(v, 2)}"
+
+LAB = {"volume": "Volume (R$)", "tipo": "Tipo", "ativo": "Ativo", "data": "Data",
+       "semana": "Semana", "mes": "Mês", "strike": "Strike (R$)", "codigo": "Opção",
+       "multiplo": "Vezes acima da média", "contratos": "Contratos", "vencimento": "Vencimento"}
+
+def estilo(fig, altura=430):
+    fig.update_layout(separators=",.", height=altura, margin=dict(l=10, r=10, t=60, b=10),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, title=None),
+                      title=dict(font=dict(size=16)))
+    return fig
+
+def grafico(cont, fig, altura=430, key=None):
+    cont.plotly_chart(estilo(fig, altura), width="stretch", key=key)
+
+CFG = {
+    "codigo": st.column_config.TextColumn("Opção"),
+    "tipo": st.column_config.TextColumn("Tipo"),
+    "ativo": st.column_config.TextColumn("Ativo"),
+    "strike": st.column_config.NumberColumn("Strike", format="localized"),
+    "vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
+    "volume": st.column_config.NumberColumn("Volume (R$)", format="compact"),
+    "contratos": st.column_config.NumberColumn("Contratos", format="localized"),
+    "negocios": st.column_config.NumberColumn("Negócios", format="localized"),
+    "media": st.column_config.NumberColumn("Média diária (R$)", format="compact"),
+    "multiplo": st.column_config.NumberColumn("Vezes a média", format="%.1fx"),
+    "fechamento": st.column_config.NumberColumn("Último preço", format="localized"),
+}
+
+def tabela(cont, d, extra=None):
+    cfg = {k: v for k, v in CFG.items() if k in d.columns}
+    cfg.update(extra or {})
+    cont.dataframe(d, width="stretch", hide_index=True, column_config=cfg)
+
+# ---------- Cotações ----------
+POPULARES = ["PETR4", "PETR3", "VALE3", "BOVA11", "ITUB4", "BBDC4", "BBAS3", "B3SA3",
+             "ABEV3", "PRIO3", "WEGE3", "MGLU3", "SUZB3", "GGBR4", "CSNA3", "USIM5",
+             "ELET3", "ITSA4", "RENT3", "LREN3", "HAPV3", "CMIG4", "BBSE3", "EMBR3",
+             "RADL3", "VBBR3", "JBSS3", "BRFS3", "CSAN3", "COGN3", "AZUL4", "SMAL11"]
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cotacao_yahoo(tk):
+    try:
+        import yfinance as yf
+        t = yf.Ticker(f"{tk}.SA")
+        dia = t.history(period="10d", interval="1d")
+        if dia.empty:
+            return None
+        intr = t.history(period="1d", interval="1m")
+        serie = intr if not intr.empty else dia
+        preco, hora = float(serie["Close"].iloc[-1]), serie.index[-1]
+        if getattr(hora, "tzinfo", None) is not None:
+            hora = hora.tz_convert("America/Sao_Paulo")
+        ant = dia[dia.index.date < hora.date()]["Close"]
+        prev = float(ant.iloc[-1]) if len(ant) else None
+        return {"preco": preco, "var": (preco / prev - 1) * 100 if prev else None,
+                "hora": hora, "fonte": "Yahoo Finance, atraso de ~15 min"}
+    except Exception:
+        return None
+
+def cotacao_b3(tk):
+    x = acoes[acoes.codigo == tk].sort_values("data")
+    if x.empty:
+        return None
+    preco = float(x.fechamento.iloc[-1])
+    prev = float(x.fechamento.iloc[-2]) if len(x) > 1 else None
+    return {"preco": preco, "var": (preco / prev - 1) * 100 if prev else None,
+            "hora": x.data.iloc[-1], "fonte": "último fechamento da B3"}
+
+def cotacao(tk):
+    if not tk:
+        return None
+    return cotacao_yahoo(tk) or cotacao_b3(tk)
+
+def texto_hora(q):
+    h = pd.Timestamp(q["hora"])
+    return h.strftime("%d/%m %H:%M") if (h.hour or h.minute) else h.strftime("%d/%m/%Y")
+
 # ---------- Barra lateral ----------
 st.sidebar.title("📈 Opções B3")
 meses = st.sidebar.slider("Meses de histórico", 1, 6, 3,
                           help="Mais meses = mais dados, mas a carga fica mais lenta.")
-if st.sidebar.button("🔄 Atualizar dados da B3", use_container_width=True):
+b_up, b_full = st.sidebar.columns(2)
+if b_up.button("🔄 Atualizar", width="stretch", help="Baixa os pregões que faltam"):
     with st.spinner("Baixando arquivos da B3..."):
         ok = atualizar(meses)
     st.cache_data.clear()
     if not ok:
         st.sidebar.warning("Nenhum arquivo novo encontrado na B3.")
-if st.sidebar.button("📦 Carga completa", use_container_width=True):
+if b_full.button("📦 Carga completa", width="stretch", help="Baixa todo o histórico de novo"):
     with st.spinner("Baixando histórico da B3 (pode levar alguns minutos)..."):
         ok = atualizar(meses, carga_anual=True)
     st.cache_data.clear()
@@ -344,11 +434,12 @@ if st.sidebar.button("📦 Carga completa", use_container_width=True):
         st.sidebar.error("Não consegui baixar os arquivos da B3. Tente de novo em alguns minutos.")
 
 if not os.path.exists(HIST):
-    st.info("Nenhum dado ainda. Clique em **Carga completa** na barra lateral.")
+    st.info("Nenhum dado ainda. Clique em **📦 Carga completa** na barra lateral.")
     st.stop()
 
 df, acoes, precos = carregar(os.path.getmtime(HIST))
 ultimo = df["data"].max()
+ativos_rank = df.groupby("ativo")["volume"].sum().sort_values(ascending=False)
 
 def spot_de(raiz):
     if acoes.empty:
@@ -359,30 +450,68 @@ def spot_de(raiz):
     r = x.sort_values("volume").iloc[-1]
     return float(r.fechamento), r.codigo
 
-ativos_rank = df.groupby("ativo")["volume"].sum().sort_values(ascending=False)
-ativo = st.sidebar.selectbox("Ativo-objeto", ativos_rank.index.tolist())
+# Lista de tickers: ações com opções, ordenadas pelo volume em opções
+raizes = list(ativos_rank.index)
+if not acoes.empty:
+    vol_acao = acoes.groupby("codigo")["volume"].sum()
+    vol_acao = vol_acao[vol_acao.index.str.match(r"^[A-Z0-9]{4}\d{1,2}$")
+                        & vol_acao.index.str[:4].isin(raizes)]
+    ordem = {r: i for i, r in enumerate(raizes)}
+    tickers = sorted(vol_acao.index, key=lambda t: (ordem[t[:4]], -vol_acao[t]))
+else:
+    tickers = []
+tickers += [t for t in POPULARES if t not in tickers and t[:4] in raizes]
+if not tickers:
+    tickers = POPULARES[:]
+ticker = st.sidebar.selectbox(
+    "Ativo", tickers, index=tickers.index("PETR4") if "PETR4" in tickers else 0,
+    accept_new_options=True, help="Escolha da lista ou digite o código, como PETR4 ou VALE3.")
+ticker = (ticker or "PETR4").strip().upper()
+ativo = ticker[:4]
+if acoes.empty:
+    st.sidebar.warning("Clique em **📦 Carga completa** uma vez para trazer os preços das ações.")
+
 top = st.sidebar.slider("Top N opções", 5, 30, 10)
-periodo = st.sidebar.date_input("Período", (df.data.min().date(), ultimo.date()))
+periodo = st.sidebar.date_input("Período", (df.data.min().date(), ultimo.date()),
+                                format="DD/MM/YYYY")
 ini, fim = (periodo if isinstance(periodo, (list, tuple)) and len(periodo) == 2
             else (df.data.min().date(), ultimo.date()))
-st.sidebar.markdown("---\n**Alertas**")
-multiplo = st.sidebar.number_input("Múltiplo da média", 1.5, 20.0, 3.0, 0.5)
-vol_min = st.sidebar.number_input("Volume mínimo (R$)", 0, 50_000_000, 500_000, 100_000)
-janela = st.sidebar.slider("Janela da média (pregões)", 5, 60, 20)
+with st.sidebar.expander("🚨 Critérios dos alertas"):
+    multiplo = st.number_input("Múltiplo da média", 1.5, 20.0, 3.0, 0.5)
+    vol_min = st.number_input("Volume mínimo (R$)", 0, 50_000_000, 500_000, 100_000)
+    janela = st.slider("Janela da média (pregões)", 5, 60, 20)
 
 per = df[(df.data >= pd.Timestamp(ini)) & (df.data <= pd.Timestamp(fim))]
 a = per[per.ativo == ativo]
 
 # ---------- Cabeçalho e KPIs ----------
-st.title(f"Opções de {ativo}")
-st.caption(f"Dados até {ultimo:%d/%m/%Y} • Fonte: COTAHIST B3")
+q = cotacao(ticker)
+h1, h2 = st.columns([4, 1])
+h1.title(ticker)
+h1.caption(f"Opções com raiz **{ativo}** • histórico de opções até {ultimo:%d/%m/%Y} "
+           "• fonte: COTAHIST B3")
+h2.write("")
+if h2.button("🔄 Atualizar cotação", width="stretch"):
+    cotacao_yahoo.clear()
+    st.rerun()
+if ativo not in raizes:
+    st.warning(f"Não encontrei opções de {ticker} no histórico carregado.")
+
 vc = a[a.tipo == "CALL"].volume.sum()
 vp = a[a.tipo == "PUT"].volume.sum()
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Volume total", brl(vc + vp))
-k2.metric("Volume CALL", brl(vc))
-k3.metric("Volume PUT", brl(vp))
-k4.metric("Put/Call ratio", f"{vp / vc:.2f}" if vc else "–")
+k0, k1, k2, k3, k4 = st.columns(5)
+if q:
+    k0.metric(f"Cotação {ticker}", f"R$ {num(q['preco'])}",
+              f"{num(q['var'])}%" if q["var"] is not None else None,
+              help=f"{q['fonte']} • {texto_hora(q)}")
+else:
+    k0.metric(f"Cotação {ticker}", "–", help="Cotação não encontrada.")
+k1.metric("Volume em opções", brl_c(vc + vp), help=brl(vc + vp))
+k2.metric("Volume CALL", brl_c(vc), help=brl(vc))
+k3.metric("Volume PUT", brl_c(vp), help=brl(vp))
+k4.metric("Put/Call ratio", num(vp / vc) if vc else "–")
+if q:
+    st.caption(f"Cotação: {q['fonte']} • {texto_hora(q)}")
 
 (aba1, aba_pc, aba2, aba3, aba4, aba5, aba_sim, aba_acomp) = st.tabs(
     ["📊 Visão geral", "⚖️ Put/Call", "📅 Por vencimento", "🗓️ Semanal", "📆 Mensal",
@@ -392,13 +521,13 @@ with aba1:
     c1, c2 = st.columns(2)
     t = per.groupby(["ativo", "tipo"], as_index=False)["volume"].sum()
     t = t[t.ativo.isin(ativos_rank.head(15).index)]
-    c1.plotly_chart(px.bar(t, x="ativo", y="volume", color="tipo", color_discrete_map=CORES,
-                           title="Ações com mais volume em opções"), use_container_width=True)
+    grafico(c1, px.bar(t, x="ativo", y="volume", color="tipo", color_discrete_map=CORES,
+                       labels=LAB, title="Ativos com mais volume em opções"))
     d = a.groupby(["data", "tipo"], as_index=False)["volume"].sum()
-    c2.plotly_chart(px.line(d, x="data", y="volume", color="tipo", color_discrete_map=CORES,
-                            title=f"Volume diário {ativo}"), use_container_width=True)
-    st.subheader(f"Mais negociadas no último pregão ({ultimo:%d/%m/%Y})")
-    st.dataframe(ranking(df[df.data == ultimo], top), use_container_width=True, hide_index=True)
+    grafico(c2, px.line(d, x="data", y="volume", color="tipo", color_discrete_map=CORES,
+                        labels=LAB, title=f"Volume diário das opções de {ativo}"))
+    st.subheader(f"Opções mais negociadas no último pregão ({ultimo:%d/%m/%Y})")
+    tabela(st, ranking(df[df.data == ultimo], top))
 
 # ---------- Put/Call ratio diário ----------
 with aba_pc:
@@ -420,24 +549,25 @@ with aba_pc:
         atual_r, med = d.ratio.iloc[-1], d.media.iloc[-1]
         pct = (d.ratio <= atual_r).mean() * 100
         m1, m2, m3 = st.columns(3)
-        m1.metric("P/C do último pregão", f"{atual_r:.2f}",
-                  f"{atual_r - med:+.2f} vs média" if pd.notna(med) else None,
+        m1.metric("P/C do último pregão", num(atual_r),
+                  f"{atual_r - med:+.2f} vs média".replace(".", ",") if pd.notna(med) else None,
                   delta_color="inverse")
-        m2.metric(f"Média de {mm} pregões", f"{med:.2f}" if pd.notna(med) else "–")
+        m2.metric(f"Média de {mm} pregões", num(med) if pd.notna(med) else "–")
         m3.metric("Percentil no período", f"{pct:.0f}%",
                   help="Em quantos % dos pregões do período o P/C ficou abaixo do valor atual.")
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=d.index, y=d.sup, line=dict(width=0), showlegend=False,
                                  hoverinfo="skip"))
         fig.add_trace(go.Scatter(x=d.index, y=d.inf, line=dict(width=0), fill="tonexty",
-                                 fillcolor="rgba(37,99,235,0.12)", name="Faixa normal (±2 desvios)"))
+                                 fillcolor="rgba(37,99,235,0.12)", name="Faixa normal",
+                                 hoverinfo="skip"))
         fig.add_trace(go.Scatter(x=d.index, y=d.ratio, name="Put/Call diário",
                                  line=dict(color="#111827", width=2)))
         fig.add_trace(go.Scatter(x=d.index, y=d.media, name=f"Média {mm}",
                                  line=dict(color="#2563eb", dash="dash")))
         fig.update_layout(title=f"Put/Call ratio diário – {ativo}", hovermode="x unified",
-                          yaxis_title="Puts ÷ Calls", height=450)
-        st.plotly_chart(fig, use_container_width=True)
+                          yaxis_title="Puts ÷ Calls", yaxis_tickformat=".2f")
+        grafico(st, fig, 450)
         if pd.notna(d.sup.iloc[-1]) and atual_r > d.sup.iloc[-1]:
             st.warning("O P/C está **acima da faixa normal**: há mais procura por puts que o "
                        "habitual para este ativo, sinal de proteção ou pessimismo.")
@@ -445,15 +575,16 @@ with aba_pc:
             st.success("O P/C está **abaixo da faixa normal**: calls dominando mais que o "
                        "habitual, sinal de otimismo acima da média.")
         else:
-            st.caption("O P/C está dentro da faixa normal do ativo.")
+            st.caption("O P/C está dentro da faixa normal do ativo (média ± 2 desvios).")
         r_at = (per.pivot_table(index="ativo", columns="tipo", values=campo, aggfunc="sum")
                   .reindex(columns=["CALL", "PUT"]).fillna(0))
         r_at = r_at.loc[r_at.index.isin(ativos_rank.head(20).index)]
         r_at = r_at[r_at.CALL > 0].assign(ratio=lambda x: x.PUT / x.CALL).sort_values("ratio")
-        st.plotly_chart(px.bar(r_at.reset_index(), x="ratio", y="ativo", orientation="h",
-                               title="Put/Call no período – 20 ativos mais negociados",
-                               labels={"ratio": "Puts ÷ Calls", "ativo": ""}, height=550),
-                        use_container_width=True)
+        fb = px.bar(r_at.reset_index(), x="ratio", y="ativo", orientation="h",
+                    title="Put/Call no período – 20 ativos mais negociados",
+                    labels={"ratio": "Puts ÷ Calls", "ativo": ""})
+        fb.update_traces(marker_color=["#2563eb" if x == ativo else "#94a3b8" for x in r_at.index])
+        grafico(st, fb, 560)
 
 with aba2:
     vencs = sorted(a.vencimento.dropna().unique())
@@ -463,33 +594,38 @@ with aba2:
         v = st.selectbox("Vencimento", vencs, index=padrao,
                          format_func=lambda x: pd.Timestamp(x).strftime("%d/%m/%Y"))
         r = ranking(a[a.vencimento == v], top)
-        st.plotly_chart(px.bar(r.sort_values("volume"), x="volume", y="codigo", color="tipo",
-                               orientation="h", color_discrete_map=CORES, hover_data=["strike"],
-                               title=f"Top opções – vencimento {pd.Timestamp(v):%d/%m/%Y}",
-                               height=600), use_container_width=True)
+        grafico(st, px.bar(r.sort_values("volume"), x="volume", y="codigo", color="tipo",
+                           orientation="h", color_discrete_map=CORES, hover_data=["strike"],
+                           labels=LAB, title=f"Opções mais negociadas – vencimento "
+                                             f"{pd.Timestamp(v):%d/%m/%Y}"), 600)
         s = a[a.vencimento == v].groupby(["strike", "tipo"], as_index=False)["volume"].sum()
-        st.plotly_chart(px.bar(s, x="strike", y="volume", color="tipo", barmode="group",
-                               color_discrete_map=CORES, title="Volume por strike"),
-                        use_container_width=True)
-        st.dataframe(r, use_container_width=True, hide_index=True)
+        fs = px.bar(s, x="strike", y="volume", color="tipo", barmode="group",
+                    color_discrete_map=CORES, labels=LAB, title="Volume por strike")
+        if q:
+            fs.add_vline(x=q["preco"], line_dash="dot", line_color="gray",
+                         annotation_text=f"{ticker} R$ {num(q['preco'])}")
+        grafico(st, fs)
+        tabela(st, r)
+    else:
+        st.info("Sem vencimentos para esse ativo no período.")
 
 for aba, col, nome in [(aba3, "semana", "semanal"), (aba4, "mes", "mensal")]:
     with aba:
         g = a.groupby([col, "tipo"], as_index=False)["volume"].sum()
-        st.plotly_chart(px.bar(g, x=col, y="volume", color="tipo", barmode="group",
-                               color_discrete_map=CORES, title=f"Volume {nome} CALL x PUT"),
-                        use_container_width=True)
+        grafico(st, px.bar(g, x=col, y="volume", color="tipo", barmode="group",
+                           color_discrete_map=CORES, labels=LAB,
+                           title=f"Volume {nome} – CALL x PUT"))
         periodos = sorted(a[col].unique(), reverse=True)
         if periodos:
             p = st.selectbox(f"Período {nome}", periodos, key=col,
-                             format_func=lambda x: pd.Timestamp(x).strftime(
-                                 "%d/%m/%Y" if col == "semana" else "%m/%Y"))
+                             format_func=lambda x, c=col: pd.Timestamp(x).strftime(
+                                 "Semana de %d/%m/%Y" if c == "semana" else "%m/%Y"))
             c1, c2 = st.columns(2)
             r = ranking(a[a[col] == p], top)
             c1.markdown("🟢 **CALLs mais negociadas**")
-            c1.dataframe(r[r.tipo == "CALL"], use_container_width=True, hide_index=True)
+            tabela(c1, r[r.tipo == "CALL"].drop(columns="tipo"))
             c2.markdown("🔴 **PUTs mais negociadas**")
-            c2.dataframe(r[r.tipo == "PUT"], use_container_width=True, hide_index=True)
+            tabela(c2, r[r.tipo == "PUT"].drop(columns="tipo"))
 
 with aba5:
     pregoes = sorted(df.data.unique())
@@ -505,71 +641,81 @@ with aba5:
     so_ativo = st.toggle(f"Mostrar só {ativo}", value=False)
     if so_ativo:
         al = al[al.ativo == ativo]
-    st.metric("Opções com volume anormal hoje", len(al))
+    st.metric(f"Opções com volume anormal em {ultimo:%d/%m/%Y}", len(al))
+    st.caption(f"Critério: volume ≥ {num(multiplo, 1)}x a média dos últimos {janela} pregões "
+               f"e acima de {brl_c(vol_min)}. Ajuste na barra lateral.")
     if not al.empty:
-        st.plotly_chart(px.scatter(al, x="multiplo", y="volume", color="tipo", size="volume",
-                                   hover_name="codigo", hover_data=["strike", "vencimento"],
-                                   color_discrete_map=CORES, log_y=True,
-                                   title="Volume x quantas vezes acima da média"),
-                        use_container_width=True)
-        st.dataframe(al, use_container_width=True, hide_index=True)
+        grafico(st, px.scatter(al, x="multiplo", y="volume", color="tipo", size="volume",
+                               hover_name="codigo", hover_data=["strike", "vencimento"],
+                               color_discrete_map=CORES, log_y=True, labels=LAB,
+                               title="Volume x quantas vezes acima da média"))
+        tabela(st, al)
     else:
         st.success("Nenhum volume anormal com os critérios atuais.")
 
 # ---------- Simulador de estratégias ----------
 with aba_sim:
-    spot0, cod_spot = spot_de(ativo)
+    spot_b3, _ = spot_de(ativo)
+    S_ref = float(q["preco"]) if q else float(spot_b3 or 30.0)
     vv_fut = sorted(df[(df.ativo == ativo) & (df.vencimento > ultimo)].vencimento.dropna().unique())
     venc_pad = pd.Timestamp(vv_fut[0]).date() if vv_fut else ultimo.date() + timedelta(days=30)
-    dias_pad = int(min(max(np.busday_count(ultimo.date(), venc_pad), 0), 500))
+    dias_pad = int(min(max(np.busday_count(date.today(), venc_pad), 0), 500))
 
-    st.markdown(f"**Ativo:** {cod_spot or ativo}" +
-                (f" • último preço {brl(spot0, 2)}" if spot0 else
-                 " • preço à vista não encontrado, informe manualmente"))
+    st.markdown("##### 1. Parâmetros")
     c = st.columns(5)
-    S0 = c[0].number_input("Preço do ativo (R$)", 0.01, 100000.0, float(spot0 or 30.0), 0.10)
-    dias = c[1].number_input("Dias úteis até o vencimento", 0, 500, dias_pad)
+    S0 = c[0].number_input(f"Preço de {ticker} (R$)", 0.01, 100000.0, round(S_ref, 2), 0.10,
+                           key=f"S0_{ticker}_{round(S_ref, 2)}",
+                           help=q["fonte"] if q else "Informe o preço manualmente.")
+    dias = c[1].number_input("Dias úteis até o vencimento", 0, 500, dias_pad,
+                             help=f"Próximo vencimento com opções: {venc_pad:%d/%m/%Y}")
     vol = c[2].number_input("Volatilidade (% a.a.)", 1.0, 300.0, 35.0, 1.0) / 100
     taxa = c[3].number_input("Juros (% a.a.)", 0.0, 50.0, 13.0, 0.25) / 100
-    qtd_pad = c[4].number_input("Qtd. padrão", 100, 10_000_000, 100, 100)
+    qtd_pad = c[4].number_input("Quantidade", 100, 10_000_000, 100, 100)
     T, r_cont = dias / 252, math.log(1 + taxa)
 
+    st.markdown("##### 2. Estratégia")
     cp0, cp1, cp2, cp3, cp4 = st.columns([1.6, 2.4, 1.3, 1, 1])
     cat = cp0.selectbox("Cenário", CATEGORIAS)
     preset = cp1.selectbox("Estratégia", [k for k, v in ESTRATEGIAS.items() if v[0] == cat])
     passo = cp2.number_input("Distância entre strikes (R$)", 0.01, 10000.0,
                              float(max(round(S0 * 0.05 * 2) / 2, 0.5)), 0.5)
     cp3.write(""); cp4.write("")
-    if cp3.button("Montar", use_container_width=True):
-        st.session_state.pernas = montar_preset(preset, S0, passo, T, r_cont, vol, qtd_pad, cod_spot)
+    chave = (preset, ticker)
+    remontar = cp3.button("Remontar", width="stretch",
+                          help="Recalcula as pernas com os parâmetros atuais")
+    if st.session_state.get("preset_atual") != chave or remontar:
+        st.session_state.preset_atual = chave
+        st.session_state.pernas = montar_preset(preset, S0, passo, T, r_cont, vol, qtd_pad, ticker)
         st.session_state.ed_v += 1
-        st.rerun()
-    if cp4.button("Limpar", use_container_width=True):
+    if cp4.button("Limpar", width="stretch"):
         st.session_state.pernas = limpar(pd.DataFrame(columns=COLS_P))
         st.session_state.ed_v += 1
         st.rerun()
-
     st.info(f"**{preset}:** {ESTRATEGIAS[preset][1]}")
-    st.caption("Edite as pernas na tabela: troque strike, prêmio ou quantidade, ou adicione "
-               "linhas. Prêmios das estratégias prontas são teóricos (Black-Scholes).")
+
+    st.markdown("##### 3. Pernas")
+    st.caption("Edite direto na tabela ou adicione linhas. Os prêmios das estratégias prontas "
+               "são teóricos (Black-Scholes); use **Adicionar opção real** pra trazer o preço "
+               "de mercado.")
     editado = st.data_editor(
         st.session_state.pernas, key=f"ed_{st.session_state.ed_v}", num_rows="dynamic",
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
         column_config={
             "Operação": st.column_config.SelectboxColumn(options=["Compra", "Venda"],
                                                          required=True, default="Compra"),
             "Tipo": st.column_config.SelectboxColumn(options=["CALL", "PUT", "AÇÃO"],
                                                      required=True, default="CALL"),
-            "Código": st.column_config.TextColumn(help="Código da opção ou da ação (opcional, "
-                                                       "usado no acompanhamento)"),
+            "Código": st.column_config.TextColumn(help="Código da opção ou da ação, usado no "
+                                                       "acompanhamento"),
             "Strike": st.column_config.NumberColumn(format="%.2f", min_value=0.0, default=0.0),
-            "Prêmio": st.column_config.NumberColumn("Prêmio / preço", format="%.2f",
+            "Prêmio": st.column_config.NumberColumn("Prêmio / preço (R$)", format="%.2f",
                                                     min_value=0.0, default=0.0),
-            "Qtd": st.column_config.NumberColumn(min_value=0, step=100, default=100),
+            "Qtd": st.column_config.NumberColumn("Quantidade", min_value=0, step=100,
+                                                 default=100, format="localized"),
         })
     pernas = limpar(editado)
 
-    with st.expander("➕ Adicionar uma opção real do último pregão"):
+    with st.expander("➕ Adicionar opção real (último pregão)"):
         hoje_a = df[(df.data == ultimo) & (df.ativo == ativo)]
         vv = sorted(hoje_a.vencimento.dropna().unique())
         if not vv:
@@ -584,45 +730,49 @@ with aba_sim:
                    .sort_values(["tipo", "strike"]).reset_index(drop=True))
             i_op = e2.selectbox("Opção", range(len(ops)), key="add_o",
                                 format_func=lambda i: f"{ops.codigo[i]} · {ops.tipo[i]} · "
-                                                      f"K {ops.strike[i]:.2f} · R$ {ops.fechamento[i]:.2f}")
+                                                      f"strike {num(ops.strike[i])} · "
+                                                      f"R$ {num(ops.fechamento[i])}")
             op = e3.selectbox("Operação", ["Compra", "Venda"], key="add_op")
-            q = e4.number_input("Qtd", 1, 10_000_000, int(qtd_pad), 100, key="add_q")
+            qq = e4.number_input("Quantidade", 1, 10_000_000, int(qtd_pad), 100, key="add_q")
             e5.write("")
-            if e5.button("Adicionar", use_container_width=True):
+            if e5.button("Adicionar", width="stretch"):
                 o = ops.iloc[i_op]
                 nova = pd.DataFrame([{"Operação": op, "Tipo": o.tipo, "Código": o.codigo,
-                                      "Strike": o.strike, "Prêmio": o.fechamento, "Qtd": float(q)}])
+                                      "Strike": o.strike, "Prêmio": o.fechamento, "Qtd": float(qq)}])
                 st.session_state.pernas = limpar(pd.concat([pernas, nova], ignore_index=True))
                 st.session_state.ed_v += 1
                 st.rerun()
-            st.caption(f"Faltam {np.busday_count(ultimo.date(), pd.Timestamp(vsel).date())} "
-                       "dias úteis para esse vencimento.")
+            st.caption(f"Preços do fechamento de {ultimo:%d/%m/%Y}. Faltam "
+                       f"{np.busday_count(date.today(), pd.Timestamp(vsel).date())} dias úteis "
+                       "para esse vencimento.")
 
+    st.markdown("##### 4. Resultado")
     if pernas.empty:
-        st.info("Escolha uma estratégia pronta e clique em **Montar**, ou adicione pernas na tabela.")
+        st.info("Escolha uma estratégia ou adicione pernas na tabela.")
     else:
         custo, lmax, pmax, bes = resumo(pernas, S0)
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Montagem", ("Débito " if custo > 0 else "Crédito ") + brl(abs(custo), 2))
         m2.metric("Lucro máximo", lmax)
         m3.metric("Prejuízo máximo", pmax)
-        m4.metric("Break-even", " / ".join(f"{b:.2f}" for b in bes) if bes else "–")
-        st.plotly_chart(grafico_payoff(pernas, S0, T, r_cont, vol), use_container_width=True)
+        m4.metric("Break-even", " / ".join(f"R$ {num(b)}" for b in bes) if bes else "–")
+        grafico(st, grafico_payoff(pernas, S0, T, r_cont, vol), 480)
         st.caption("Linha azul: resultado no vencimento. Linha tracejada: resultado teórico hoje, "
                    "pela volatilidade e prazo informados. Opções de ações na B3 são americanas; "
                    "o modelo é uma aproximação.")
 
         s1, s2, s3 = st.columns([2, 1, 1])
-        nome_est = s1.text_input("Nome da estratégia", f"{preset} {ativo}")
-        venc_est = s2.date_input("Vencimento", venc_pad, key="venc_est")
+        nome_est = s1.text_input("Nome da estratégia", f"{preset} {ticker}")
+        venc_est = s2.date_input("Vencimento", venc_pad, key="venc_est", format="DD/MM/YYYY")
         s3.write("")
-        if s3.button("💾 Salvar para acompanhar", use_container_width=True):
+        if s3.button("💾 Salvar para acompanhar", width="stretch"):
             st.session_state.estrategias.append({
                 "id": datetime.now().strftime("%Y%m%d%H%M%S%f"), "nome": nome_est,
-                "ativo": ativo, "spot_entrada": S0, "criada": date.today().isoformat(),
-                "vencimento": venc_est.isoformat(), "pernas": pernas.to_dict("records")})
+                "ativo": ativo, "ticker": ticker, "spot_entrada": S0,
+                "criada": date.today().isoformat(), "vencimento": venc_est.isoformat(),
+                "pernas": pernas.to_dict("records")})
             salvar_est()
-            st.success("Estratégia salva! Veja na aba **Minhas estratégias**.")
+            st.success("Estratégia salva! Veja na aba **📒 Minhas estratégias**.")
 
 # ---------- Acompanhamento ----------
 with aba_acomp:
@@ -630,9 +780,9 @@ with aba_acomp:
     b1, b2 = st.columns(2)
     b1.download_button("⬇️ Baixar backup das estratégias",
                        json.dumps(ests, ensure_ascii=False, default=float, indent=1),
-                       "estrategias.json", "application/json", use_container_width=True)
+                       "estrategias.json", "application/json", width="stretch")
     up = b2.file_uploader("Restaurar backup", type="json", label_visibility="collapsed")
-    if up is not None and b2.button("Restaurar este backup", use_container_width=True):
+    if up is not None and b2.button("Restaurar este backup", width="stretch"):
         st.session_state.estrategias = json.load(up)
         salvar_est()
         st.rerun()
@@ -640,53 +790,62 @@ with aba_acomp:
                "Baixe o backup de vez em quando.")
 
     if not ests:
-        st.info("Nenhuma estratégia salva ainda. Monte uma no **Simulador** e clique em salvar.")
+        st.info("Nenhuma estratégia salva ainda. Monte uma no **🧮 Simulador** e clique em salvar.")
     else:
         linhas, detalhes = [], []
         for e in ests:
+            tk = e.get("ticker") or spot_de(e["ativo"])[1] or e["ativo"]
+            qe = cotacao(tk)
             p = limpar(pd.DataFrame(e["pernas"]))
             sg = sinal(p)
             atual = p["Código"].map(precos)
+            for i in p.index[p["Tipo"] == "AÇÃO"]:
+                qa = cotacao(p.at[i, "Código"] or tk)
+                if qa:
+                    atual[i] = qa["preco"]
             sem_preco = atual.isna()
             atual = atual.fillna(p["Prêmio"])
             p["Preço atual"] = atual
-            p["P&L (R$)"] = sg * p["Qtd"] * (atual - p["Prêmio"])
+            p["Resultado (R$)"] = sg * p["Qtd"] * (atual - p["Prêmio"])
             custo = float((sg * p["Qtd"] * p["Prêmio"]).sum())
-            pl = float(p["P&L (R$)"].sum())
+            pl = float(p["Resultado (R$)"].sum())
             try:
                 dias_r = int(np.busday_count(date.today(), date.fromisoformat(e["vencimento"])))
             except Exception:
                 dias_r = None
-            linhas.append({"Estratégia": e["nome"], "Ativo": e["ativo"], "Montada em": e["criada"],
-                           "Vencimento": e["vencimento"], "Dias úteis": dias_r,
-                           "Montagem (R$)": custo, "P&L (R$)": pl,
-                           "P&L (%)": pl / abs(custo) * 100 if custo else None})
-            detalhes.append((e, p, sem_preco, pl))
+            linhas.append({"Estratégia": e["nome"], "Ativo": tk,
+                           "Montada em": pd.to_datetime(e["criada"]),
+                           "Vencimento": pd.to_datetime(e["vencimento"]), "Dias úteis": dias_r,
+                           "Montagem (R$)": custo, "Resultado (R$)": pl,
+                           "Resultado (%)": pl / abs(custo) * 100 if custo else None})
+            detalhes.append((e, tk, qe, p, sem_preco, pl))
 
         tab = pd.DataFrame(linhas)
-        st.metric("Resultado total das estratégias", brl(tab["P&L (R$)"].sum(), 2))
-        st.dataframe(tab, use_container_width=True, hide_index=True, column_config={
-            "Montagem (R$)": st.column_config.NumberColumn(format="R$ %.2f"),
-            "P&L (R$)": st.column_config.NumberColumn(format="R$ %.2f"),
-            "P&L (%)": st.column_config.NumberColumn(format="%.1f%%")})
-        st.caption(f"Preços atuais pelo último fechamento disponível ({ultimo:%d/%m/%Y}). "
-                   "Clique em **Atualizar dados da B3** para trazer o pregão mais recente.")
+        st.metric("Resultado total das estratégias", brl(tab["Resultado (R$)"].sum(), 2))
+        st.dataframe(tab, width="stretch", hide_index=True, column_config={
+            "Montada em": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Vencimento": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Montagem (R$)": st.column_config.NumberColumn(format="localized"),
+            "Resultado (R$)": st.column_config.NumberColumn(format="localized"),
+            "Resultado (%)": st.column_config.NumberColumn(format="%.1f%%")})
+        st.caption(f"Ações: cotação atual (Yahoo, ~15 min de atraso). Opções: último fechamento "
+                   f"da B3 ({ultimo:%d/%m/%Y}); clique em **🔄 Atualizar** na barra lateral "
+                   "pra trazer o pregão mais recente.")
 
-        for e, p, sem_preco, pl in detalhes:
+        for e, tk, qe, p, sem_preco, pl in detalhes:
             icone = "🟢" if pl >= 0 else "🔴"
             with st.expander(f"{icone} {e['nome']} • {brl(pl, 2)}"):
                 if sem_preco.any():
                     st.caption("⚠️ Pernas sem código ou sem negócio recente estão avaliadas pelo "
-                               "preço de entrada. Preencha o código na hora de montar para "
-                               "acompanhar de verdade.")
-                st.dataframe(p, use_container_width=True, hide_index=True, column_config={
+                               "preço de entrada. Preencha o código pra acompanhar de verdade.")
+                st.dataframe(p, width="stretch", hide_index=True, column_config={
                     "Prêmio": st.column_config.NumberColumn("Entrada", format="%.2f"),
                     "Preço atual": st.column_config.NumberColumn(format="%.2f"),
-                    "P&L (R$)": st.column_config.NumberColumn(format="R$ %.2f")})
-                spot_now = spot_de(e["ativo"])[0] or float(e.get("spot_entrada", 0)) or 1.0
-                st.plotly_chart(grafico_payoff(p[COLS_P], spot_now, titulo="Payoff no vencimento",
-                                               ponto=(spot_now, pl)),
-                                use_container_width=True, key=f"g_{e['id']}")
+                    "Qtd": st.column_config.NumberColumn("Quantidade", format="localized"),
+                    "Resultado (R$)": st.column_config.NumberColumn(format="localized")})
+                spot_now = (qe["preco"] if qe else None) or float(e.get("spot_entrada", 0)) or 1.0
+                grafico(st, grafico_payoff(p[COLS_P], spot_now, titulo="Payoff no vencimento",
+                                           ponto=(spot_now, pl)), 450, key=f"g_{e['id']}")
                 if st.button("🗑️ Excluir estratégia", key=f"del_{e['id']}"):
                     st.session_state.estrategias = [x for x in ests if x["id"] != e["id"]]
                     salvar_est()
