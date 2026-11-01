@@ -1840,7 +1840,7 @@ with aba_q:
 
     # ===== 3. Suportes e resistências pelo fluxo de opções =====
     st.subheader("3. Suportes e resistências pelo fluxo de opções")
-    res_wall = sup_wall = mp = None
+    res_wall = sup_wall = mp = pv = None
     if o_q.empty:
         st.info("Sem dados de opções com preço à vista para esse ativo.")
     else:
@@ -2055,3 +2055,308 @@ with aba_q:
                        f"simulador ({dias} d.u.). O resultado considera o payoff no vencimento.")
     else:
         st.caption("Monte uma estratégia no **🧮 Simulador** pra ver a probabilidade de lucro dela aqui.")
+
+    # ===== 5. Gráfico de candles com estudos =====
+    st.subheader("5. Gráfico de candles com estudos")
+    TEMPOS = {"2 min": ("2m", ["1d", "5d", "1mo"], "5d"),
+              "5 min": ("5m", ["1d", "5d", "1mo", "60d"], "5d"),
+              "15 min": ("15m", ["5d", "1mo", "60d"], "1mo"),
+              "60 min": ("60m", ["1mo", "3mo", "6mo", "1y", "2y"], "3mo"),
+              "Diário": ("1d", ["3mo", "6mo", "1y", "2y", "5y"], "1y"),
+              "Semanal": ("1wk", ["1y", "2y", "5y", "10y", "max"], "5y"),
+              "Mensal": ("1mo", ["2y", "5y", "10y", "max"], "10y"),
+              "Anual": ("1mo", ["max"], "max")}
+    NOME_PER = {"1d": "1 dia", "5d": "5 dias", "1mo": "1 mês", "60d": "60 dias", "3mo": "3 meses",
+                "6mo": "6 meses", "1y": "1 ano", "2y": "2 anos", "5y": "5 anos", "10y": "10 anos",
+                "max": "Máximo"}
+    ESTUDOS = ["Muros de calls e puts", "Max pain", "Mapa de strikes (volume por strike)",
+               "Desvios padrão do Quant", "Bandas de desvio padrão", "Cone de probabilidade",
+               "Distribuição Monte Carlo (lateral)", "Faixa de 90% do Monte Carlo",
+               "Perfil de volume (lateral)", "Médias móveis", "VWAP",
+               "Break-evens e strikes da estratégia", "Volume", "RSI"]
+
+    cc1, cc2, cc3 = st.columns([3.2, 1.2, 1])
+    tempo = cc1.segmented_control("Tempo gráfico", list(TEMPOS), default="Diário",
+                                  key="cd_tempo") or "Diário"
+    intervalo, periodos_ok, per_pad = TEMPOS[tempo]
+    periodo_c = cc2.selectbox("Período", periodos_ok, index=periodos_ok.index(per_pad),
+                              key=f"cd_per_{tempo}", format_func=lambda x: NOME_PER[x])
+    cc3.write("")
+    heikin = cc3.toggle("Heikin-Ashi", value=False, key="cd_ha",
+                        help="Candles suavizados, que deixam a tendência mais clara.")
+    estudos = st.multiselect("Estudos no gráfico", ESTUDOS, key="cd_est",
+                             default=["Muros de calls e puts", "Desvios padrão do Quant",
+                                      "Distribuição Monte Carlo (lateral)", "Médias móveis",
+                                      "Volume"])
+    with st.expander("⚙️ Configurar estudos"):
+        e1, e2, e3, e4 = st.columns(4)
+        medias = e1.multiselect("Médias móveis", ["MME 9", "MME 21", "MMA 50", "MMA 200"],
+                                default=["MME 9", "MME 21", "MMA 50"], key="cd_mm")
+        jan_bb = e2.number_input("Bandas: janela (candles)", 5, 200, 20, key="cd_bbj")
+        mult_bb = e2.multiselect("Bandas: desvios", [1.0, 2.0, 3.0], default=[1.0, 2.0],
+                                 key="cd_bbm")
+        rsi_n = e3.number_input("RSI: período", 2, 50, 14, key="cd_rsi")
+        n_strk = e3.number_input("Mapa de strikes: quantos", 3, 30, 10, key="cd_nstrk")
+        cone_n = e4.number_input("Cone: candles à frente", 5, 260, 21, key="cd_cone",
+                                 help="Só nos tempos diário, semanal e mensal.")
+        bins_vp = e4.number_input("Perfil de volume: faixas", 10, 120, 40, key="cd_bins")
+
+    @st.cache_data(ttl=60, show_spinner="Buscando candles...")
+    def candles(tk, intervalo, periodo, anual):
+        try:
+            import yfinance as yf
+            h = yf.Ticker(f"{tk}.SA").history(period=periodo, interval=intervalo, auto_adjust=False)
+            if h is None or len(h) == 0:
+                return None
+            h = h[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+            idx = pd.to_datetime(h.index)
+            if idx.tz is not None:
+                idx = idx.tz_convert("America/Sao_Paulo").tz_localize(None)
+            h.index = idx
+            if anual:
+                h = h.resample("YE").agg({"Open": "first", "High": "max", "Low": "min",
+                                          "Close": "last", "Volume": "sum"}).dropna()
+                h.index = h.index.to_period("Y").to_timestamp()
+            return h
+        except Exception:
+            return None
+
+    cd = candles(ticker, intervalo, periodo_c, tempo == "Anual")
+    if cd is None or cd.empty:
+        if tempo in ("Diário", "Semanal", "Mensal", "Anual") and len(fech):
+            regra = {"Diário": "D", "Semanal": "W", "Mensal": "ME", "Anual": "YE"}[tempo]
+            b = fech.resample(regra).agg(["first", "max", "min", "last"]).dropna()
+            cd = pd.DataFrame({"Open": b["first"], "High": b["max"], "Low": b["min"],
+                               "Close": b["last"], "Volume": 0.0})
+            st.caption("⚠️ Candles do Yahoo indisponíveis: usando fechamentos diários "
+                       f"({fonte_h}), então máximas e mínimas são aproximadas.")
+        else:
+            st.warning("Não consegui buscar candles intraday agora. Tente o botão "
+                       "**🔄 Atualizar cotação** ou um tempo gráfico diário ou maior.")
+            cd = None
+
+    if cd is not None and len(cd) > 1:
+        cd = cd.copy()
+        o_, h_, l_, c_ = cd.Open, cd.High, cd.Low, cd.Close
+        if heikin:
+            c_ha = (o_ + h_ + l_ + c_) / 4
+            arr_c, arr_o = c_ha.to_numpy(), np.empty(len(cd))
+            arr_o[0] = (o_.iloc[0] + c_.iloc[0]) / 2
+            for i_ in range(1, len(cd)):
+                arr_o[i_] = (arr_o[i_ - 1] + arr_c[i_ - 1]) / 2
+            o_ha = pd.Series(arr_o, index=cd.index)
+            h_ = pd.concat([h_, o_ha, c_ha], axis=1).max(axis=1)
+            l_ = pd.concat([l_, o_ha, c_ha], axis=1).min(axis=1)
+            o_, c_ = o_ha, c_ha
+        intraday = intervalo.endswith("m") and tempo not in ("Mensal", "Anual")
+        lateral = [e for e in ("Distribuição Monte Carlo (lateral)", "Perfil de volume (lateral)")
+                   if e in estudos]
+        sub_rows = [e for e in ("Volume", "RSI") if e in estudos]
+        if "Volume" in sub_rows and cd.Volume.sum() == 0:
+            sub_rows.remove("Volume")
+        n_rows = 1 + len(sub_rows)
+        alturas = [0.68] + [0.16] * len(sub_rows) if sub_rows else [1.0]
+        tot = sum(alturas)
+        alturas = [a_ / tot for a_ in alturas]
+        from plotly.subplots import make_subplots
+        figc = make_subplots(rows=n_rows, cols=2, shared_xaxes=True, shared_yaxes=True,
+                             column_widths=[0.84, 0.16] if lateral else [0.999, 0.001],
+                             row_heights=alturas, horizontal_spacing=0.005,
+                             vertical_spacing=0.03,
+                             specs=[[{}, {}]] + [[{}, None] for _ in sub_rows])
+        figc.add_trace(go.Candlestick(x=cd.index, open=o_, high=h_, low=l_, close=c_,
+                                      name=ticker, increasing_line_color=CORES["CALL"],
+                                      decreasing_line_color=CORES["PUT"],
+                                      increasing_fillcolor=CORES["CALL"],
+                                      decreasing_fillcolor=CORES["PUT"]), row=1, col=1)
+        px_ref = float(cd.Close.iloc[-1])
+        y_lo, y_hi = float(cd.Low.min()), float(cd.High.max())
+        niveis_y = []
+
+        def linha_h(y, cor, texto, traco="dash", larg=1.2, opac=1.0, lado="right"):
+            if y is None or not np.isfinite(y) or y <= 0:
+                return
+            niveis_y.append(y)
+            figc.add_hline(y=y, line_color=cor, line_dash=traco, line_width=larg, opacity=opac,
+                           annotation_text=texto, annotation_position=f"top {lado}",
+                           annotation_font_size=10, annotation_font_color=cor, row=1, col=1)
+
+        # Médias móveis
+        if "Médias móveis" in estudos:
+            cores_mm = {"MME 9": "#f59e0b", "MME 21": "#8b5cf6", "MMA 50": "#0ea5e9",
+                        "MMA 200": "#111827"}
+            for mm_ in medias:
+                n_ = int(mm_.split()[1])
+                if len(cd) < n_:
+                    continue
+                serie_mm = (cd.Close.ewm(span=n_, adjust=False).mean() if mm_.startswith("MME")
+                            else cd.Close.rolling(n_).mean())
+                figc.add_trace(go.Scatter(x=cd.index, y=serie_mm, name=mm_,
+                                          line=dict(color=cores_mm[mm_], width=1.4)), row=1, col=1)
+        # Bandas de desvio padrão (sobre o próprio tempo gráfico)
+        if "Bandas de desvio padrão" in estudos and len(cd) > jan_bb:
+            mb = cd.Close.rolling(int(jan_bb)).mean()
+            sb = cd.Close.rolling(int(jan_bb)).std()
+            for k_ in sorted(mult_bb, reverse=True):
+                alfa = {1.0: 0.14, 2.0: 0.08, 3.0: 0.05}[k_]
+                figc.add_trace(go.Scatter(x=cd.index, y=mb + k_ * sb, line=dict(width=0.6,
+                               color="rgba(37,99,235,0.5)"), showlegend=False, hoverinfo="skip"),
+                               row=1, col=1)
+                figc.add_trace(go.Scatter(x=cd.index, y=mb - k_ * sb, line=dict(width=0.6,
+                               color="rgba(37,99,235,0.5)"), fill="tonexty",
+                               fillcolor=f"rgba(37,99,235,{alfa})", name=f"±{k_:g}σ ({jan_bb})",
+                               hoverinfo="skip"), row=1, col=1)
+            figc.add_trace(go.Scatter(x=cd.index, y=mb, name=f"Média {jan_bb}",
+                                      line=dict(color="#2563eb", dash="dot", width=1)), row=1, col=1)
+        # VWAP (intraday reinicia a cada pregão; nos demais, ancorada no início)
+        if "VWAP" in estudos and cd.Volume.sum() > 0:
+            tp_ = (cd.High + cd.Low + cd.Close) / 3
+            chave_v = cd.index.date if intraday else np.zeros(len(cd))
+            pv_ = (tp_ * cd.Volume).groupby(chave_v).cumsum()
+            vv_ = cd.Volume.groupby(chave_v).cumsum().replace(0, np.nan)
+            figc.add_trace(go.Scatter(x=cd.index, y=pv_ / vv_, name="VWAP" if intraday
+                                      else "VWAP ancorada", line=dict(color="#db2777", width=1.6)),
+                           row=1, col=1)
+        # Muros, max pain e mapa de strikes (aba Quant, item 3)
+        if "Muros de calls e puts" in estudos:
+            linha_h(res_wall, CORES["CALL"], f"Muro de calls {num(res_wall)}" if res_wall else "",
+                    larg=2)
+            linha_h(sup_wall, CORES["PUT"], f"Muro de puts {num(sup_wall)}" if sup_wall else "",
+                    larg=2)
+            if not res_wall and not sup_wall:
+                st.caption("Muros indisponíveis: escolha um vencimento no item 3.")
+        if "Max pain" in estudos and mp:
+            linha_h(mp, "#7c3aed", f"Max pain {num(mp)}", traco="dashdot")
+        pv_strk = globals().get("pv")
+        if "Mapa de strikes (volume por strike)" in estudos and pv_strk is not None:
+            tot_s = (pv_strk.CALL + pv_strk.PUT).sort_values(ascending=False).head(int(n_strk))
+            vmax_ = tot_s.max() or 1
+            for k_, vol_k in tot_s.items():
+                dom_call = pv_strk.CALL.get(k_, 0) >= pv_strk.PUT.get(k_, 0)
+                linha_h(float(k_), CORES["CALL"] if dom_call else CORES["PUT"], "",
+                        traco="solid", larg=1 + 6 * vol_k / vmax_, opac=0.15 + 0.35 * vol_k / vmax_)
+        # Desvios padrão dos horizontes escolhidos no item 2
+        if "Desvios padrão do Quant" in estudos:
+            cores_h = ["#0ea5e9", "#f59e0b", "#8b5cf6", "#14b8a6", "#e11d48", "#64748b"]
+            for i_h, (nome_h, h_n) in enumerate(globals().get("hz", {}).items()):
+                vol_h = hv(h_n)
+                if not np.isfinite(vol_h):
+                    continue
+                mov_h = S_now * vol_h * math.sqrt(h_n / 252)
+                cor_h = cores_h[i_h % len(cores_h)]
+                for k_ in (1, 2):
+                    for sg_ in (1, -1):
+                        linha_h(S_now + sg_ * k_ * mov_h, cor_h,
+                                f"{nome_h} {'+' if sg_ > 0 else '−'}{k_}σ", traco="dot",
+                                opac=0.9 if k_ == 1 else 0.55, lado="left")
+        # Monte Carlo: faixa de 90% e distribuição lateral (item 4)
+        if "Faixa de 90% do Monte Carlo" in estudos:
+            p5, p95 = np.percentile(final, [5, 95])
+            linha_h(p5, "#2563eb", f"MC 5% {num(p5)}", traco="longdash")
+            linha_h(p95, "#2563eb", f"MC 95% {num(p95)}", traco="longdash")
+        # Break-evens e strikes da estratégia do simulador
+        if "Break-evens e strikes da estratégia" in estudos and not pernas.empty:
+            for b_ in bes:
+                linha_h(float(b_), "#111827", f"Break-even {num(b_)}", traco="solid", larg=1.5)
+            for _, p_ in pernas[pernas.Tipo != "AÇÃO"].iterrows():
+                linha_h(float(p_.Strike), "#94a3b8",
+                        f"{'C' if p_['Operação'] == 'Compra' else 'V'} {p_.Tipo} {num(p_.Strike)}",
+                        traco="dot", lado="left")
+        # Cone de probabilidade à frente (tempos diário ou maiores)
+        if "Cone de probabilidade" in estudos and tempo in ("Diário", "Semanal", "Mensal"):
+            passo_c = {"Diário": 1, "Semanal": 5, "Mensal": 21}[tempo]
+            freq_c = {"Diário": "B", "Semanal": "W-FRI", "Mensal": "ME"}[tempo]
+            fut_c = pd.date_range(cd.index[-1], periods=int(cone_n) + 1, freq=freq_c)
+            tt_c = np.arange(int(cone_n) + 1) * passo_c / 252
+            for k_, alfa in [(2, 0.08), (1, 0.16)]:
+                sup_c = px_ref * np.exp(k_ * sigma * np.sqrt(tt_c))
+                inf_c = px_ref * np.exp(-k_ * sigma * np.sqrt(tt_c))
+                figc.add_trace(go.Scatter(x=fut_c, y=sup_c, line=dict(width=0.8,
+                               color="rgba(245,158,11,0.8)", dash="dot"), showlegend=False,
+                               hoverinfo="skip"), row=1, col=1)
+                figc.add_trace(go.Scatter(x=fut_c, y=inf_c, line=dict(width=0.8,
+                               color="rgba(245,158,11,0.8)", dash="dot"), fill="tonexty",
+                               fillcolor=f"rgba(245,158,11,{alfa})", name=f"Cone ±{k_}σ",
+                               hoverinfo="skip"), row=1, col=1)
+                y_lo, y_hi = min(y_lo, inf_c.min()), max(y_hi, sup_c.max())
+        elif "Cone de probabilidade" in estudos:
+            st.caption("O cone de probabilidade aparece nos tempos diário, semanal e mensal.")
+        # Painel lateral: distribuição Monte Carlo e perfil de volume
+        if "Distribuição Monte Carlo (lateral)" in estudos:
+            hist_mc, bord = np.histogram(final, bins=60)
+            meio = (bord[:-1] + bord[1:]) / 2
+            figc.add_trace(go.Bar(y=meio, x=hist_mc / hist_mc.max(), orientation="h",
+                                  marker_color="rgba(37,99,235,0.45)", name="Distribuição MC",
+                                  hovertemplate="R$ %{y:.2f}<br>densidade relativa %{x:.2f}"
+                                                "<extra>Monte Carlo</extra>",
+                                  width=float(bord[1] - bord[0])), row=1, col=2)
+        if "Perfil de volume (lateral)" in estudos and cd.Volume.sum() > 0:
+            tp_ = (cd.High + cd.Low + cd.Close) / 3
+            hv_, bv_ = np.histogram(tp_, bins=int(bins_vp), weights=cd.Volume)
+            mv_ = (bv_[:-1] + bv_[1:]) / 2
+            poc = float(mv_[np.argmax(hv_)])
+            figc.add_trace(go.Bar(y=mv_, x=hv_ / hv_.max(), orientation="h",
+                                  marker_color=["rgba(219,39,119,0.75)" if m_ == poc
+                                                else "rgba(148,163,184,0.55)" for m_ in mv_],
+                                  name="Perfil de volume", width=float(bv_[1] - bv_[0]),
+                                  hovertemplate="R$ %{y:.2f}<br>volume relativo %{x:.2f}"
+                                                "<extra>Perfil de volume</extra>"), row=1, col=2)
+            linha_h(poc, "#db2777", f"POC {num(poc)}", traco="dot", lado="left")
+        # Subgráficos: volume e RSI
+        linha_sub = 2
+        if "Volume" in sub_rows:
+            cor_v = np.where(cd.Close >= cd.Open, "rgba(22,163,74,0.6)", "rgba(220,38,38,0.6)")
+            figc.add_trace(go.Bar(x=cd.index, y=cd.Volume, marker_color=cor_v, name="Volume",
+                                  showlegend=False), row=linha_sub, col=1)
+            figc.update_yaxes(title_text="Volume", tickformat=".2s", row=linha_sub, col=1)
+            linha_sub += 1
+        if "RSI" in sub_rows:
+            dlt_ = cd.Close.diff()
+            ganho = dlt_.clip(lower=0).ewm(alpha=1 / rsi_n, adjust=False).mean()
+            perda = (-dlt_.clip(upper=0)).ewm(alpha=1 / rsi_n, adjust=False).mean()
+            rsi = 100 - 100 / (1 + ganho / perda.replace(0, np.nan))
+            figc.add_trace(go.Scatter(x=cd.index, y=rsi, name=f"RSI {rsi_n}",
+                                      line=dict(color="#7c3aed", width=1.3), showlegend=False),
+                           row=linha_sub, col=1)
+            for nv_r, cor_r in [(70, CORES["PUT"]), (30, CORES["CALL"])]:
+                figc.add_hline(y=nv_r, line_dash="dot", line_color=cor_r, line_width=1,
+                               row=linha_sub, col=1)
+            figc.update_yaxes(title_text="RSI", range=[0, 100], row=linha_sub, col=1)
+
+        # Eixo y: candles visíveis + níveis próximos (sem esmagar o gráfico)
+        perto = [y for y in niveis_y if y_lo * 0.85 <= y <= y_hi * 1.15]
+        y0, y1_ = min([y_lo] + perto), max([y_hi] + perto)
+        folga = (y1_ - y0) * 0.04
+        figc.update_yaxes(range=[y0 - folga, y1_ + folga], tickformat=",.2f", row=1, col=1)
+        quebras = []
+        if tempo == "Diário" or intraday:
+            quebras.append(dict(bounds=["sat", "mon"]))
+        if intraday:
+            quebras.append(dict(bounds=[18.5, 9.9], pattern="hour"))
+        figc.update_xaxes(rangebreaks=quebras, rangeslider_visible=False, row=1, col=1)
+        for rr in range(2, n_rows + 1):
+            figc.update_xaxes(rangebreaks=quebras, row=rr, col=1)
+        figc.update_xaxes(showticklabels=False, showgrid=False, row=1, col=2)
+        figc.update_layout(
+            title=f"{ticker} • {tempo} • {NOME_PER[periodo_c]}" + (" • Heikin-Ashi" if heikin else ""),
+            hovermode="x unified", bargap=0.02, dragmode="pan",
+            legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0, title=None))
+        grafico(st, figc, 560 + 150 * len(sub_rows), key="cd_graf")
+
+        # Leitura rápida
+        ult_c = float(cd.Close.iloc[-1])
+        var_c = (ult_c / float(cd.Close.iloc[0]) - 1) * 100
+        lt1, lt2, lt3, lt4 = st.columns(4)
+        lt1.metric("Último candle", f"R$ {num(ult_c)}", f"{num(var_c, 2)}% no período")
+        lt2.metric("Máxima / mínima do período", f"{num(cd.High.max())} / {num(cd.Low.min())}")
+        acima = [y for y in niveis_y if y > ult_c]
+        abaixo = [y for y in niveis_y if y < ult_c]
+        lt3.metric("Nível mais próximo acima", f"R$ {num(min(acima))}" if acima else "–",
+                   f"{num((min(acima) / ult_c - 1) * 100, 1)}%" if acima else None)
+        lt4.metric("Nível mais próximo abaixo", f"R$ {num(max(abaixo))}" if abaixo else "–",
+                   f"{num((max(abaixo) / ult_c - 1) * 100, 1)}%" if abaixo else None)
+        st.caption("Candles: Yahoo Finance (intraday com ~15 min de atraso; o Yahoo guarda "
+                   "2, 5 e 15 min por até 60 dias e 60 min por até 2 anos). Muros, desvios e "
+                   "Monte Carlo vêm dos itens 2 a 4 desta aba e mudam junto com os filtros de lá. "
+                   "No painel lateral, as barras mostram intensidade relativa (0 a 1). Arraste pra "
+                   "navegar e dê duplo clique pra voltar ao zoom original.")
