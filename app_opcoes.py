@@ -464,6 +464,308 @@ def texto_hora(q):
     h = pd.Timestamp(q["hora"])
     return h.strftime("%d/%m %H:%M") if (h.hour or h.minute) else h.strftime("%d/%m/%Y")
 
+# ---------- Análises quantitativas ----------
+@st.cache_data(show_spinner="Calculando volatilidade implícita...")
+def base_quant(versao, raiz, tk, r):
+    sp = acoes[acoes.codigo == tk][["data", "fechamento"]].rename(columns={"fechamento": "spot"})
+    o = df[df.ativo == raiz][["data", "codigo", "tipo", "strike", "vencimento", "fechamento",
+                              "volume", "contratos", "negocios"]].merge(sp, on="data")
+    o = o.dropna(subset=["vencimento"])
+    o = o[(o.strike > 0) & (o.fechamento > 0) & (o.spot > 0)].copy()
+    if o.empty:
+        return o, pd.DataFrame()
+    o["du"] = np.busday_count(o.data.values.astype("datetime64[D]"),
+                              o.vencimento.values.astype("datetime64[D]"))
+    o = o[o.du > 0].copy()
+    o["T"] = o.du / 252
+    call = (o.tipo == "CALL").to_numpy()
+    o["iv"] = iv_vec(o.fechamento.to_numpy(), o.spot.to_numpy(), o.strike.to_numpy(),
+                     o["T"].to_numpy(), r, call)
+    # Série diária de IV: opções perto do dinheiro, 5 a 70 dias úteis, com liquidez
+    mon = (o.strike / o.spot - 1).abs()
+    b = o[o.iv.between(0.03, 2.5) & (mon <= 0.12) & o.du.between(5, 70) & (o.negocios >= 3)].copy()
+    b["w"] = b.volume * np.exp(-((b.strike / b.spot - 1) / 0.04) ** 2)
+    b["wiv"] = b.w * b.iv
+    def media_pond(x):
+        s = x.groupby("data")[["wiv", "w"]].sum()
+        return s.wiv / s.w.replace(0, np.nan)
+    serie = pd.DataFrame({"IV": media_pond(b), "IV calls": media_pond(b[b.tipo == "CALL"]),
+                          "IV puts": media_pond(b[b.tipo == "PUT"])}).dropna(subset=["IV"])
+    # Pressão compradora/vendedora estimada: variação do prêmio além do que o delta explica
+    iv_dia = serie["IV"].reindex(o.data).to_numpy()
+    vol_d = np.where(np.isnan(iv_dia), 0.35, iv_dia)
+    d1 = bs_vec(o.spot.to_numpy(), o.strike.to_numpy(), o["T"].to_numpy(), r, vol_d, call)[1]
+    o["delta"] = np.where(call, ncdf(d1), ncdf(d1) - 1)
+    o = o.sort_values(["codigo", "data"])
+    g = o.groupby("codigo")
+    resid = (o.fechamento - g.fechamento.shift()) - o.delta * (o.spot - g.spot.shift())
+    o["pressao"] = np.sign(resid).fillna(0) * o.volume
+    return o, serie
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def hist_yahoo(tk):
+    try:
+        import yfinance as yf
+        h = yf.Ticker(f"{tk}.SA").history(period="2y", interval="1d", auto_adjust=False)
+        if h.empty or len(h) < 30:
+            return None
+        h.index = pd.to_datetime(h.index).tz_localize(None).normalize()
+        aj = h["Adj Close"] if "Adj Close" in h else h["Close"]
+        return h["Close"].astype(float), aj.astype(float)
+    except Exception:
+        return None
+
+def historico_precos(tk):
+    y = hist_yahoo(tk)
+    if y is not None:
+        return y[0], y[1], "Yahoo Finance, 2 anos"
+    x = acoes[acoes.codigo == tk].set_index("data")["fechamento"].sort_index()
+    return x, x, "COTAHIST B3"
+
+@st.cache_data(show_spinner="Rodando simulações...")
+def monte_carlo(S0, sigma, mu, dias, n, metodo, rets, seed):
+    rng = np.random.default_rng(seed)
+    dt = 1 / 252
+    if metodo == "Bootstrap" and len(rets) > 20:
+        base = rets - rets.mean()
+        lr = rng.choice(base, size=(n, dias)).astype(np.float32) + np.float32(mu * dt)
+    else:
+        z = rng.standard_normal((n, dias), dtype=np.float32)
+        lr = np.float32((mu - 0.5 * sigma ** 2) * dt) + np.float32(sigma * math.sqrt(dt)) * z
+    return (S0 * np.exp(np.cumsum(lr, axis=1))).astype(np.float32)
+
+def max_pain(f):
+    """Strike em que o total pago aos titulares das opções seria mínimo (aproximação)."""
+    ks = np.sort(f.strike.unique())
+    if len(ks) == 0:
+        return None
+    c = f[f.tipo == "CALL"].groupby("strike").contratos.sum()
+    p = f[f.tipo == "PUT"].groupby("strike").contratos.sum()
+    custo = [(c * np.maximum(P - c.index, 0)).sum() + (p * np.maximum(p.index - P, 0)).sum()
+             for P in ks]
+    return float(ks[int(np.argmin(custo))])
+
+# ---------- Montagem automática com opções reais ----------
+import itertools
+
+OBJETIVOS = ["Equilibrado", "Maior probabilidade de sucesso", "Melhor valor esperado",
+             "Melhor retorno sobre o risco", "Maior crédito recebido"]
+
+def _massas(S, T, r, sigma, G=361):
+    """Grade de preços finais e probabilidade de cada um (log-normal)."""
+    s = max(sigma, 0.01) * math.sqrt(max(T, 1 / 252))
+    z = np.linspace(-5, 5, G)
+    x = S * np.exp((r - sigma ** 2 / 2) * max(T, 1 / 252) + s * z)
+    cdf = ncdf((z[:-1] + z[1:]) / 2)
+    massa = np.diff(np.concatenate([[0.0], cdf, [1.0]]))
+    return x, massa
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def gerar_montagens(nome, cadeia_v, S, T, r, sigma, qtd, sup, res, min_neg=0,
+                    max_strikes=24, faixa=0.25, ancorar=True):
+    """Testa todas as combinações de strikes reais que respeitam o formato da estratégia."""
+    legs = ESTRATEGIAS[nome][2]
+    opc = [lg for lg in legs if lg[1] != "AÇÃO"]
+    acao = [lg for lg in legs if lg[1] == "AÇÃO"]
+    if not opc or cadeia_v.empty:
+        return pd.DataFrame()
+    c = cadeia_v[(cadeia_v.negocios >= min_neg) & cadeia_v.strike.between(S * (1 - faixa), S * (1 + faixa))]
+    c = c.sort_values("negocios").drop_duplicates(["tipo", "strike"], keep="last")
+    livro = {(t, k): row for t, k, row in zip(c.tipo, c.strike, c.itertuples(index=False))}
+    strikes = np.array(sorted(c.strike.unique()))
+    if len(strikes) > max_strikes:
+        strikes = np.sort(strikes[np.argsort(np.abs(strikes - S))[:max_strikes]])
+    offs = sorted({lg[2] for lg in opc})
+    precisa = {o: {lg[1] for lg in opc if lg[2] == o} for o in offs}
+    validos = [{k for k in strikes if all((t, k) in livro for t in precisa[o])} for o in offs]
+    if ancorar:  # strikes "abaixo" na estratégia ficam abaixo da cotação, e vice-versa
+        validos = [{k for k in v if (o == 0) or (o < 0 and k <= S * 1.01) or (o > 0 and k >= S * 0.99)}
+                   for o, v in zip(offs, validos)]
+    combos = [cb for cb in itertools.combinations(strikes, len(offs))
+              if all(cb[j] in validos[j] for j in range(len(offs)))]
+    if not combos:
+        return pd.DataFrame()
+    combos = np.array(combos, float)                                   # (n, n_offs)
+    idx = [offs.index(lg[2]) for lg in opc]
+    K = combos[:, idx]                                                 # (n, L)
+    is_call = np.array([lg[1] == "CALL" for lg in opc])
+    sgq = np.array([(1 if lg[0] == "Compra" else -1) * lg[3] * qtd for lg in opc], float)
+    tipos = [lg[1] for lg in opc]
+    get = lambda col: np.array([[getattr(livro[(tipos[j], k)], col) for j, k in enumerate(row)]
+                                for row in K])
+    prem, neg = get("fechamento").astype(float), get("negocios").astype(float)
+    cods = get("codigo")
+    dlt, tht, vga = (get(cn).astype(float) for cn in ("Delta", "Theta", "Vega"))
+    sgq_a = sum((1 if lg[0] == "Compra" else -1) * lg[3] * qtd for lg in acao)
+
+    def payoff(x):                                                     # x: (n, M)
+        intr = np.where(is_call[None, :, None], np.maximum(x[:, None, :] - K[:, :, None], 0),
+                        np.maximum(K[:, :, None] - x[:, None, :], 0))
+        v = (sgq[None, :, None] * (intr - prem[:, :, None])).sum(axis=1)
+        return v + sgq_a * (x - S)
+
+    # Lucro e prejuízo máximos exatos: o payoff é linear entre strikes
+    kmax = K.max(axis=1, keepdims=True)
+    nos = np.concatenate([np.full((len(K), 1), 1e-6), K, kmax * 3, kmax * 6], axis=1)
+    pn = payoff(nos)
+    inclin = pn[:, -1] - pn[:, -2]
+    lucro_max = np.where(inclin > 1e-6, np.inf, pn.max(axis=1))
+    perda_max = np.where(inclin < -1e-6, -np.inf, pn.min(axis=1))
+    # Probabilidades na grade log-normal
+    x, massa = _massas(S, T, r, sigma)
+    pop, ev, p50, pmin, pmaxg = [], [], [], [], []
+    faixa3 = np.abs(np.linspace(-5, 5, len(x))) <= 3
+    for i0 in range(0, len(K), 1500):
+        sl = slice(i0, i0 + 1500)
+        Ks, ps = K[sl], prem[sl]
+        intr = np.where(is_call[None, :, None], np.maximum(x[None, None, :] - Ks[:, :, None], 0),
+                        np.maximum(Ks[:, :, None] - x[None, None, :], 0))
+        sub = (sgq[None, :, None] * (intr - ps[:, :, None])).sum(axis=1) + sgq_a * (x - S)
+        pop.append((sub > 0) @ massa)
+        ev.append(sub @ massa)
+        lm = lucro_max[sl]
+        alvo = np.where(np.isfinite(lm), 0.5 * lm, np.inf)
+        p50.append((sub >= np.maximum(alvo, 1e-9)[:, None]) @ massa)
+        pmin.append(sub[:, faixa3].min(axis=1))
+        pmaxg.append(sub[:, faixa3].max(axis=1))
+    pop, ev, p50 = np.concatenate(pop), np.concatenate(ev), np.concatenate(p50)
+    p50 = np.where(np.isfinite(lucro_max), p50, np.nan)
+    pmin, pmaxg = np.concatenate(pmin), np.concatenate(pmaxg)
+    risco = np.where(np.isfinite(perda_max), -perda_max, -pmin)
+    custo0 = (sgq[None, :] * prem).sum(axis=1) + sgq_a * S
+    risco = np.maximum(risco, np.maximum(0.01 * np.abs(custo0), 1.0))
+    potencial = np.where(np.isfinite(lucro_max), lucro_max, pmaxg)
+    custo = (sgq[None, :] * prem).sum(axis=1) + sgq_a * S
+    # Muros: vendas de call no muro de calls ou acima; vendas de put no muro de puts ou abaixo
+    vend_call = (sgq < 0) & is_call
+    vend_put = (sgq < 0) & ~is_call
+    ok_c = np.all(~vend_call[None, :] | (K >= (res or np.inf) - 1e-9), axis=1) if vend_call.any() else np.ones(len(K), bool)
+    ok_p = np.all(~vend_put[None, :] | (K <= (sup or 0) + 1e-9), axis=1) if vend_put.any() else np.ones(len(K), bool)
+    tem_venda = vend_call.any() or vend_put.any()
+    if res is None:
+        ok_c = ok_c & ~vend_call.any()
+    if sup is None:
+        ok_p = ok_p & ~vend_put.any()
+    muro = (ok_c & ok_p) if tem_venda else np.zeros(len(K), bool)
+    sg_ = np.sign(sgq)
+    desc = [" | ".join(f"{'C' if sg_[j] > 0 else 'V'} {'' if abs(opc[j][3]) == 1 else str(opc[j][3]) + 'x '}"
+                       f"{tipos[j]} {num(K[i, j])}" for j in range(len(opc))) for i in range(len(K))]
+    if acao:
+        desc = ["Ação + " + d for d in desc]
+    out = pd.DataFrame({
+        "Montagem": desc, "PoP": pop * 100, "P50": p50 * 100, "EV": ev, "Custo": custo,
+        "LucroMax": lucro_max, "PerdaMax": perda_max, "Risco": risco, "Potencial": potencial,
+        "Delta": (sgq * dlt).sum(axis=1) + sgq_a, "Theta": (sgq * tht).sum(axis=1),
+        "Vega": (sgq * vga).sum(axis=1), "MinNeg": neg.min(axis=1), "Muro": muro})
+    out["EV/Risco"] = out.EV / out.Risco * 100
+    out["Ret/Risco"] = out.Potencial / out.Risco
+    out["_K"] = list(K)
+    out["_P"] = list(prem)
+    out["_C"] = list(cods)
+    return out
+
+def pontuar(res, objetivo, ivr, usar_muros):
+    if res.empty:
+        return res
+    r = res.copy()
+    rk = lambda s: s.rank(pct=True)
+    credito = r.Custo < 0
+    ivfit = np.zeros(len(r))
+    if ivr is not None and pd.notna(ivr):
+        ivfit = np.where((ivr >= 60) & credito | (ivr <= 30) & ~credito, 1.0, 0.0)
+    muro = r.Muro.astype(float) if usar_muros else 0.0
+    if objetivo == "Maior probabilidade de sucesso":
+        sc = r.PoP + 2 * rk(r["EV/Risco"]) + 3 * muro
+    elif objetivo == "Melhor valor esperado":
+        sc = rk(r["EV/Risco"]) + 0.08 * muro + 0.03 * ivfit
+    elif objetivo == "Melhor retorno sobre o risco":
+        sc = rk(r["Ret/Risco"]) + 0.15 * rk(r.PoP) + 0.08 * muro
+    elif objetivo == "Maior crédito recebido":
+        sc = rk(-r.Custo) + 0.2 * rk(r.PoP) + 0.08 * muro
+    else:
+        sc = (0.40 * rk(r.PoP) + 0.35 * rk(r["EV/Risco"]) + 0.15 * rk(r.MinNeg)
+              + 0.10 * muro + 0.05 * ivfit)
+    r["Score"] = sc
+    return r.sort_values("Score", ascending=False)
+
+def filtrar(res, pop_rng, tipo_m, risco_max, exigir_muro):
+    if res.empty:
+        return res
+    f = res[res.PerdaMax <= 0]          # "lucro garantido" = preço defasado no último negócio
+    f = f[f.PoP.between(*pop_rng)]
+    if tipo_m == "Só crédito":
+        f = f[f.Custo < 0]
+    elif tipo_m == "Só débito":
+        f = f[f.Custo > 0]
+    if risco_max:
+        f = f[f.Risco <= risco_max]
+    if exigir_muro:
+        f = f[f.Muro]
+    return f
+
+def pernas_de(nome, linha, qtd, S, cod_acao):
+    opc = [lg for lg in ESTRATEGIAS[nome][2] if lg[1] != "AÇÃO"]
+    rows = [{"Operação": op, "Tipo": "AÇÃO", "Código": cod_acao, "Strike": 0.0,
+             "Prêmio": round(S, 2), "Qtd": float(qtd * m)}
+            for op, tp, _, m in ESTRATEGIAS[nome][2] if tp == "AÇÃO"]
+    for j, (op, tp, _, m) in enumerate(opc):
+        rows.append({"Operação": op, "Tipo": tp, "Código": linha["_C"][j],
+                     "Strike": float(linha["_K"][j]), "Prêmio": float(linha["_P"][j]),
+                     "Qtd": float(qtd * m)})
+    return limpar(pd.DataFrame(rows))
+
+def muros_fluxo(raiz, venc, S, npreg=10):
+    """Muro de calls acima e de puts abaixo da cotação, pelos contratos negociados."""
+    datas_m = sorted(df.data.unique())[-npreg:]
+    f = df[(df.ativo == raiz) & (df.vencimento == venc) & df.data.isin(datas_m)]
+    if f.empty:
+        return None, None
+    pv = (f.pivot_table(index="strike", columns="tipo", values="contratos", aggfunc="sum")
+            .reindex(columns=["CALL", "PUT"]).fillna(0))
+    ac, ab = pv[pv.index > S], pv[pv.index < S]
+    res = float(ac.CALL.idxmax()) if not ac.empty and ac.CALL.max() > 0 else None
+    sup = float(ab.PUT.idxmax()) if not ab.empty and ab.PUT.max() > 0 else None
+    return sup, res
+
+@st.cache_data(show_spinner=False)
+def cadeia(versao, raiz, tk, S, r, vol_pad):
+    """Opções do último pregão com IV e gregas."""
+    h = df[(df.data == ultimo) & (df.ativo == raiz)]
+    if h.empty:
+        return h
+    c = (h.dropna(subset=["vencimento"])
+          .groupby(["codigo", "tipo", "strike", "vencimento"], as_index=False)
+          .agg(fechamento=("fechamento", "last"), volume=("volume", "sum"),
+               negocios=("negocios", "sum")))
+    c = c[(c.strike > 0) & (c.fechamento > 0)].copy()
+    sp = acoes[(acoes.codigo == tk) & (acoes.data == ultimo)].fechamento
+    S_fech = float(sp.iloc[0]) if len(sp) else S
+    du_fech = np.busday_count(np.datetime64(ultimo.date()),
+                              c.vencimento.values.astype("datetime64[D]"))
+    du_hoje = np.busday_count(np.datetime64(date.today()),
+                              c.vencimento.values.astype("datetime64[D]"))
+    call = (c.tipo == "CALL").to_numpy()
+    T_fech = np.maximum(du_fech, 1) / 252
+    c["IV"] = iv_vec(c.fechamento.to_numpy(), np.full(len(c), S_fech),
+                     c.strike.to_numpy(), T_fech, r, call)
+    vol_use = np.where(np.isnan(c.IV), vol_pad, c.IV)
+    c["Dias úteis"] = np.maximum(du_hoje, 0)
+    d, g, t, v, p = gregas(np.full(len(c), S), c.strike.to_numpy(),
+                           np.maximum(du_hoje, 1) / 252, r, vol_use, call)
+    c["Delta"], c["Gama"], c["Theta"], c["Vega"], c["Prob. ITM"] = d, g, t, v, p * 100
+    c["|Delta|"] = np.abs(d)
+    c["IV"] = c.IV * 100
+    return c
+
+def iv_atm(c_v, S):
+    """IV no dinheiro do vencimento, ponderada pela proximidade do strike."""
+    x = c_v.dropna(subset=["IV"])
+    x = x[x.IV.between(3, 250)]
+    if x.empty:
+        return None
+    w = np.exp(-((x.strike / S - 1) / 0.03) ** 2) * np.sqrt(x.negocios + 1)
+    return float((w * x.IV).sum() / w.sum() / 100) if w.sum() > 0 else None
+
 # ---------- Barra lateral ----------
 st.sidebar.title("📈 Opções B3")
 meses = st.sidebar.slider("Meses de histórico", 1, 6, 3,
@@ -715,7 +1017,15 @@ with aba_sim:
     S0 = c[0].number_input(f"Preço de {ticker} (R$)", 0.01, 100000.0, round(S_ref, 2), 0.10,
                            key=f"S0_{ticker}_{round(S_ref, 2)}",
                            help=q["fonte"] if q else "Informe o preço manualmente.")
-    dias = c[1].number_input("Dias úteis até o vencimento", 0, 500, dias_pad,
+    if st.session_state.get("_dias_tk") != ticker or "dias_sim" not in st.session_state:
+        st.session_state.dias_sim = dias_pad
+        st.session_state.venc_est = venc_pad
+        st.session_state._dias_tk = ticker
+    if "_dias_pend" in st.session_state:
+        st.session_state.dias_sim = int(st.session_state.pop("_dias_pend"))
+    if "_venc_pend" in st.session_state:
+        st.session_state.venc_est = st.session_state.pop("_venc_pend")
+    dias = c[1].number_input("Dias úteis até o vencimento", 0, 500, key="dias_sim",
                              help=f"Próximo vencimento com opções: {venc_pad:%d/%m/%Y}")
     vol = c[2].number_input("Volatilidade (% a.a.)", 1.0, 300.0, 35.0, 1.0) / 100
     taxa = c[3].number_input("Juros (% a.a.)", 0.0, 50.0, 13.0, 0.25) / 100
@@ -742,6 +1052,215 @@ with aba_sim:
         st.rerun()
     st.info(f"**{preset}:** {ESTRATEGIAS[preset][1]}")
 
+    # ===== Montagem automática com opções reais =====
+    st.markdown("##### 🤖 Montagem automática com opções reais")
+    ch = cadeia(os.path.getmtime(HIST), ativo, ticker, round(S0, 2), round(r_cont, 6), round(vol, 4))
+    with st.container(border=True):
+        if ch.empty:
+            st.caption("Sem opções negociadas no último pregão para montar automaticamente.")
+        else:
+            vv_a = sorted(ch.vencimento.unique())
+            fut_a = [x for x in vv_a if np.busday_count(date.today(), pd.Timestamp(x).date()) >= 1]
+            vv_a = fut_a or vv_a
+            u1, u2, u3 = st.columns([1.2, 1.8, 1.2])
+            v_auto = u1.selectbox("Vencimento", vv_a, key="auto_v",
+                                  format_func=lambda x: f"{pd.Timestamp(x):%d/%m/%Y} "
+                                  f"({np.busday_count(date.today(), pd.Timestamp(x).date())} d.u.)")
+            objetivo = u2.selectbox("Objetivo", OBJETIVOS, key="auto_obj",
+                                    help="Equilibrado combina probabilidade, valor esperado, "
+                                         "liquidez, muros e IV Rank.")
+            tipo_m = u3.selectbox("Montagem", ["Qualquer", "Só crédito", "Só débito"], key="auto_tm")
+
+            c_v = ch[ch.vencimento == v_auto]
+            du_a = int(max(np.busday_count(date.today(), pd.Timestamp(v_auto).date()), 1))
+            T_a = du_a / 252
+            iv_v = iv_atm(c_v, S0)
+            _, serie_ctx = base_quant(os.path.getmtime(HIST), ativo, ticker, round(r_cont, 6))
+            ivr_ctx = None
+            if len(serie_ctx) > 10:
+                s_ = serie_ctx["IV"]
+                if s_.max() > s_.min():
+                    ivr_ctx = float((s_.iloc[-1] - s_.min()) / (s_.max() - s_.min()) * 100)
+            sup_a, res_a = muros_fluxo(ativo, v_auto, S0)
+
+            w1, w2, w3, w4, w5 = st.columns(5)
+            fonte_sig = w1.selectbox("Vol. para probabilidade",
+                                     (["IV do vencimento"] if iv_v else []) + ["Vol. do simulador"],
+                                     key="auto_sig",
+                                     help="A IV do vencimento é a expectativa de oscilação que o "
+                                          "próprio mercado está precificando.")
+            sig_a = iv_v if (fonte_sig == "IV do vencimento" and iv_v) else vol
+            w2.metric("IV do vencimento", f"{num(iv_v * 100, 1)}%" if iv_v else "–")
+            w3.metric("IV Rank", f"{ivr_ctx:.0f}" if ivr_ctx is not None else "–")
+            w4.metric("Muro de puts (suporte)", f"R$ {num(sup_a)}" if sup_a else "–")
+            w5.metric("Muro de calls (resistência)", f"R$ {num(res_a)}" if res_a else "–")
+
+            if ivr_ctx is not None:
+                if ivr_ctx >= 60:
+                    st.caption(f"📌 IV Rank {ivr_ctx:.0f}: opções caras. O motor favorece "
+                               "montagens de **crédito**; Iron Condor, Jade Lizard, travas de "
+                               "crédito e venda coberta tendem a se encaixar melhor.")
+                elif ivr_ctx <= 30:
+                    st.caption(f"📌 IV Rank {ivr_ctx:.0f}: opções baratas. O motor favorece "
+                               "montagens de **débito**; compra de opções, travas de débito, "
+                               "borboletas e straddles comprados tendem a se encaixar melhor.")
+                else:
+                    st.caption(f"📌 IV Rank {ivr_ctx:.0f}: volatilidade em nível intermediário.")
+
+            x1, x2, x3, x4 = st.columns([2.2, 1, 1, 1.3])
+            pop_rng = x1.slider("Probabilidade de sucesso (%)", 0, 100, (0, 100), 5,
+                                key="auto_pop",
+                                help="Chance estimada de terminar com lucro no vencimento. "
+                                     "Mais probabilidade costuma significar ganho menor em "
+                                     "relação ao risco.")
+            min_neg = x2.number_input("Negócios mín./perna", 0, 1000, 3, 1, key="auto_neg",
+                                      help="Filtra opções sem liquidez no último pregão.")
+            risco_max = x3.number_input("Risco máx. (R$)", 0, 100_000_000, 0, 100, key="auto_rm",
+                                        help="0 = sem limite.")
+            x4.write("")
+            usar_muros = x4.toggle("Priorizar muros", value=True, key="auto_muro",
+                                   help="Dá preferência a montagens cujas vendas de call ficam no "
+                                        "muro de calls ou acima e as vendas de put no muro de "
+                                        "puts ou abaixo.")
+            y1, y2 = st.columns(2)
+            exigir = y1.toggle("Exigir que todas as vendas fiquem protegidas pelos muros",
+                               value=False, key="auto_exig")
+            ancorar = y2.toggle("Respeitar a posição dos strikes da estratégia", value=True,
+                                key="auto_anc",
+                                help="Ex.: no Iron Condor as vendas ficam fora do dinheiro; no "
+                                     "financiamento a call vendida fica dentro do dinheiro. "
+                                     "Desligue pra testar variações livres.")
+
+            with st.spinner("Testando combinações com as opções reais..."):
+                brutos = gerar_montagens(preset, c_v, round(S0, 2), T_a, r_cont, round(sig_a, 4),
+                                         int(qtd_pad), sup_a, res_a, int(min_neg),
+                                         ancorar=ancorar)
+            if brutos.empty:
+                st.warning("Não há opções reais suficientes nesse vencimento pra montar essa "
+                           "estratégia. Tente outro vencimento ou reduza os negócios mínimos.")
+            else:
+                cand = pontuar(filtrar(brutos, pop_rng, tipo_m, risco_max, exigir),
+                               objetivo, ivr_ctx, usar_muros)
+                n_def = int((brutos.PerdaMax > 0).sum())
+                st.caption((f"{len(brutos):,} combinações testadas • {len(cand):,} passam nos "
+                            f"filtros • probabilidade calculada com vol. de "
+                            f"{num(sig_a * 100, 1)}% a.a. e {du_a} dias úteis").replace(",", ".")
+                           + (f" • {n_def} descartadas por preço defasado (lucro 'garantido')"
+                              if n_def else ""))
+                if cand.empty:
+                    st.info("Nenhuma montagem passou nos filtros. Amplie a faixa de probabilidade "
+                            "ou o risco máximo, ou desligue a exigência dos muros.")
+                else:
+                    top_n = cand.head(15).reset_index(drop=True)
+                    fmt_lim = lambda v: "Ilimitado" if not np.isfinite(v) else v
+                    vis = pd.DataFrame({
+                        "Montagem": top_n.Montagem,
+                        "Prob. sucesso": top_n.PoP,
+                        "Prob. ≥50% do lucro": top_n.P50,
+                        "Crédito/Débito": np.where(top_n.Custo < 0, "Crédito", "Débito"),
+                        "Valor (R$)": top_n.Custo.abs(),
+                        "Lucro máx.": [("Ilimitado" if not np.isfinite(v) else brl(v, 0))
+                                       for v in top_n.LucroMax],
+                        "Prejuízo máx.": [("Ilimitado" if not np.isfinite(v) else brl(v, 0))
+                                          for v in top_n.PerdaMax],
+                        "Valor esperado": top_n.EV,
+                        "Retorno/risco": top_n["Ret/Risco"],
+                        "Delta": top_n.Delta, "Theta/dia": top_n.Theta,
+                        "Muros": np.where(top_n.Muro, "🛡️", ""),
+                        "Liquidez": top_n.MinNeg})
+                    sel_a = st.dataframe(
+                        vis, width="stretch", hide_index=True, on_select="rerun",
+                        selection_mode="single-row",
+                        key=f"auto_tab_{preset}_{st.session_state.ed_v}",
+                        column_config={
+                            "Prob. sucesso": st.column_config.ProgressColumn(
+                                min_value=0, max_value=100, format="%.0f%%"),
+                            "Prob. ≥50% do lucro": st.column_config.NumberColumn(format="%.0f%%"),
+                            "Valor (R$)": st.column_config.NumberColumn(format="%.2f"),
+                            "Valor esperado": st.column_config.NumberColumn(format="%.2f"),
+                            "Retorno/risco": st.column_config.NumberColumn(format="%.2f"),
+                            "Delta": st.column_config.NumberColumn(format="%.0f"),
+                            "Theta/dia": st.column_config.NumberColumn(format="%.2f"),
+                            "Liquidez": st.column_config.NumberColumn(
+                                "Negócios (perna menos líquida)", format="localized")})
+                    try:
+                        i_sel = list(sel_a.selection.rows)[0]
+                    except Exception:
+                        i_sel = 0
+                    esc = top_n.iloc[i_sel]
+                    pern_esc = pernas_de(preset, esc, int(qtd_pad), S0, ticker)
+                    pv1, pv2 = st.columns([3, 1.2])
+                    figp = grafico_payoff(pern_esc, S0, titulo=f"Prévia: {esc.Montagem}")
+                    for nv, cor, nm in [(sup_a, CORES["PUT"], "Muro de puts"),
+                                        (res_a, CORES["CALL"], "Muro de calls")]:
+                        if nv:
+                            figp.add_vline(x=nv, line_color=cor, line_dash="dash",
+                                           annotation_text=nm)
+                    grafico(pv1, figp, 400, key="auto_prev")
+                    pv2.markdown(f"**{'🥇 Melhor montagem' if i_sel == 0 else 'Montagem selecionada'}**")
+                    pv2.dataframe(pern_esc[["Operação", "Tipo", "Código", "Strike", "Prêmio"]],
+                                  hide_index=True, width="stretch")
+                    razoes = []
+                    razoes.append(f"Probabilidade de sucesso de **{num(esc.PoP, 0)}%**")
+                    if esc.EV > 0:
+                        razoes.append("valor esperado **positivo** pelos preços atuais")
+                    if esc.Muro:
+                        razoes.append("vendas **protegidas pelos muros** de opções")
+                    if ivr_ctx is not None and ((ivr_ctx >= 60 and esc.Custo < 0)
+                                                or (ivr_ctx <= 30 and esc.Custo > 0)):
+                        razoes.append("tipo de montagem **alinhado ao IV Rank**")
+                    pv2.markdown("; ".join(razoes) + ".")
+                    if pv2.button("✅ Carregar no simulador", type="primary", width="stretch"):
+                        st.session_state.pernas = pern_esc
+                        st.session_state.ed_v += 1
+                        st.session_state._dias_pend = du_a
+                        st.session_state._venc_pend = pd.Timestamp(v_auto).date()
+                        st.rerun()
+                    st.caption("Prêmios do último negócio do pregão, não do livro de ofertas: "
+                               "confira os preços na corretora antes de montar. A probabilidade "
+                               "assume distribuição log-normal com a volatilidade escolhida; os "
+                               "muros entram como preferência, não mudam a probabilidade.")
+
+            with st.expander("📊 Comparar todas as estratégias para o mercado atual"):
+                st.caption("Busca a melhor montagem real de cada estratégia nesse vencimento, "
+                           "com os mesmos filtros e objetivo acima.")
+                if st.button("Rodar comparação", key="auto_cmp"):
+                    linhas_c = []
+                    barra = st.progress(0.0)
+                    for i_e, nm_e in enumerate(PRESETS):
+                        b = gerar_montagens(nm_e, c_v, round(S0, 2), T_a, r_cont, round(sig_a, 4),
+                                            int(qtd_pad), sup_a, res_a, int(min_neg),
+                                            max_strikes=16, ancorar=ancorar)
+                        b = pontuar(filtrar(b, pop_rng, tipo_m, risco_max, exigir),
+                                    objetivo, ivr_ctx, usar_muros)
+                        barra.progress((i_e + 1) / len(PRESETS))
+                        if b.empty:
+                            continue
+                        m_ = b.iloc[0]
+                        linhas_c.append({
+                            "Cenário": ESTRATEGIAS[nm_e][0], "Estratégia": nm_e,
+                            "Melhor montagem": m_.Montagem, "Prob. sucesso": m_.PoP,
+                            "Crédito/Débito": "Crédito" if m_.Custo < 0 else "Débito",
+                            "Valor esperado": m_.EV, "VE/risco (%)": m_["EV/Risco"],
+                            "Retorno/risco": m_["Ret/Risco"],
+                            "Prejuízo máx.": "Ilimitado" if not np.isfinite(m_.PerdaMax)
+                            else brl(m_.PerdaMax, 0),
+                            "Muros": "🛡️" if m_.Muro else "", "_s": m_.Score})
+                    barra.empty()
+                    st.session_state.auto_cmp_res = pd.DataFrame(linhas_c)
+                cmp_res = st.session_state.get("auto_cmp_res")
+                if cmp_res is not None and not cmp_res.empty:
+                    st.dataframe(
+                        cmp_res.sort_values("VE/risco (%)", ascending=False).drop(columns="_s"),
+                        width="stretch", hide_index=True, column_config={
+                            "Prob. sucesso": st.column_config.ProgressColumn(
+                                min_value=0, max_value=100, format="%.0f%%"),
+                            "Valor esperado": st.column_config.NumberColumn(format="%.2f"),
+                            "VE/risco (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Retorno/risco": st.column_config.NumberColumn(format="%.2f")})
+                    st.caption("Ordenado pelo valor esperado por real de risco. Pra carregar uma delas, escolha a "
+                               "estratégia no seletor acima.")
+
     st.markdown("##### 3. Pernas")
     st.caption("Edite direto na tabela ou adicione linhas. Os prêmios das estratégias prontas "
                "são teóricos (Black-Scholes); use **Adicionar opção real** pra trazer o preço "
@@ -764,37 +1283,7 @@ with aba_sim:
         })
     pernas = limpar(editado)
 
-    @st.cache_data(show_spinner=False)
-    def cadeia(versao, raiz, tk, S, r, vol_pad):
-        """Opções do último pregão com IV e gregas."""
-        h = df[(df.data == ultimo) & (df.ativo == raiz)]
-        if h.empty:
-            return h
-        c = (h.dropna(subset=["vencimento"])
-              .groupby(["codigo", "tipo", "strike", "vencimento"], as_index=False)
-              .agg(fechamento=("fechamento", "last"), volume=("volume", "sum"),
-                   negocios=("negocios", "sum")))
-        c = c[(c.strike > 0) & (c.fechamento > 0)].copy()
-        sp = acoes[(acoes.codigo == tk) & (acoes.data == ultimo)].fechamento
-        S_fech = float(sp.iloc[0]) if len(sp) else S
-        du_fech = np.busday_count(np.datetime64(ultimo.date()),
-                                  c.vencimento.values.astype("datetime64[D]"))
-        du_hoje = np.busday_count(np.datetime64(date.today()),
-                                  c.vencimento.values.astype("datetime64[D]"))
-        call = (c.tipo == "CALL").to_numpy()
-        T_fech = np.maximum(du_fech, 1) / 252
-        c["IV"] = iv_vec(c.fechamento.to_numpy(), np.full(len(c), S_fech),
-                         c.strike.to_numpy(), T_fech, r, call)
-        vol_use = np.where(np.isnan(c.IV), vol_pad, c.IV)
-        c["Dias úteis"] = np.maximum(du_hoje, 0)
-        d, g, t, v, p = gregas(np.full(len(c), S), c.strike.to_numpy(),
-                               np.maximum(du_hoje, 1) / 252, r, vol_use, call)
-        c["Delta"], c["Gama"], c["Theta"], c["Vega"], c["Prob. ITM"] = d, g, t, v, p * 100
-        c["|Delta|"] = np.abs(d)
-        c["IV"] = c.IV * 100
-        return c
-
-    with st.expander("➕ Adicionar opção real (último pregão)", expanded=True):
+    with st.expander("➕ Adicionar opção real manualmente (último pregão)"):
         ch = cadeia(os.path.getmtime(HIST), ativo, ticker, round(S0, 2), round(r_cont, 6),
                     round(vol, 4))
         if ch.empty:
@@ -926,7 +1415,7 @@ with aba_sim:
 
         s1, s2, s3 = st.columns([2, 1, 1])
         nome_est = s1.text_input("Nome da estratégia", f"{preset} {ticker}")
-        venc_est = s2.date_input("Vencimento", venc_pad, key="venc_est", format="DD/MM/YYYY")
+        venc_est = s2.date_input("Vencimento", key="venc_est", format="DD/MM/YYYY")
         s3.write("")
         if s3.button("💾 Salvar para acompanhar", width="stretch"):
             st.session_state.estrategias.append({
@@ -1013,87 +1502,6 @@ with aba_acomp:
                     st.session_state.estrategias = [x for x in ests if x["id"] != e["id"]]
                     salvar_est()
                     st.rerun()
-
-# ---------- Análises quantitativas ----------
-@st.cache_data(show_spinner="Calculando volatilidade implícita...")
-def base_quant(versao, raiz, tk, r):
-    sp = acoes[acoes.codigo == tk][["data", "fechamento"]].rename(columns={"fechamento": "spot"})
-    o = df[df.ativo == raiz][["data", "codigo", "tipo", "strike", "vencimento", "fechamento",
-                              "volume", "contratos", "negocios"]].merge(sp, on="data")
-    o = o.dropna(subset=["vencimento"])
-    o = o[(o.strike > 0) & (o.fechamento > 0) & (o.spot > 0)].copy()
-    if o.empty:
-        return o, pd.DataFrame()
-    o["du"] = np.busday_count(o.data.values.astype("datetime64[D]"),
-                              o.vencimento.values.astype("datetime64[D]"))
-    o = o[o.du > 0].copy()
-    o["T"] = o.du / 252
-    call = (o.tipo == "CALL").to_numpy()
-    o["iv"] = iv_vec(o.fechamento.to_numpy(), o.spot.to_numpy(), o.strike.to_numpy(),
-                     o["T"].to_numpy(), r, call)
-    # Série diária de IV: opções perto do dinheiro, 5 a 70 dias úteis, com liquidez
-    mon = (o.strike / o.spot - 1).abs()
-    b = o[o.iv.between(0.03, 2.5) & (mon <= 0.12) & o.du.between(5, 70) & (o.negocios >= 3)].copy()
-    b["w"] = b.volume * np.exp(-((b.strike / b.spot - 1) / 0.04) ** 2)
-    b["wiv"] = b.w * b.iv
-    def media_pond(x):
-        s = x.groupby("data")[["wiv", "w"]].sum()
-        return s.wiv / s.w.replace(0, np.nan)
-    serie = pd.DataFrame({"IV": media_pond(b), "IV calls": media_pond(b[b.tipo == "CALL"]),
-                          "IV puts": media_pond(b[b.tipo == "PUT"])}).dropna(subset=["IV"])
-    # Pressão compradora/vendedora estimada: variação do prêmio além do que o delta explica
-    iv_dia = serie["IV"].reindex(o.data).to_numpy()
-    vol_d = np.where(np.isnan(iv_dia), 0.35, iv_dia)
-    d1 = bs_vec(o.spot.to_numpy(), o.strike.to_numpy(), o["T"].to_numpy(), r, vol_d, call)[1]
-    o["delta"] = np.where(call, ncdf(d1), ncdf(d1) - 1)
-    o = o.sort_values(["codigo", "data"])
-    g = o.groupby("codigo")
-    resid = (o.fechamento - g.fechamento.shift()) - o.delta * (o.spot - g.spot.shift())
-    o["pressao"] = np.sign(resid).fillna(0) * o.volume
-    return o, serie
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def hist_yahoo(tk):
-    try:
-        import yfinance as yf
-        h = yf.Ticker(f"{tk}.SA").history(period="2y", interval="1d", auto_adjust=False)
-        if h.empty or len(h) < 30:
-            return None
-        h.index = pd.to_datetime(h.index).tz_localize(None).normalize()
-        aj = h["Adj Close"] if "Adj Close" in h else h["Close"]
-        return h["Close"].astype(float), aj.astype(float)
-    except Exception:
-        return None
-
-def historico_precos(tk):
-    y = hist_yahoo(tk)
-    if y is not None:
-        return y[0], y[1], "Yahoo Finance, 2 anos"
-    x = acoes[acoes.codigo == tk].set_index("data")["fechamento"].sort_index()
-    return x, x, "COTAHIST B3"
-
-@st.cache_data(show_spinner="Rodando simulações...")
-def monte_carlo(S0, sigma, mu, dias, n, metodo, rets, seed):
-    rng = np.random.default_rng(seed)
-    dt = 1 / 252
-    if metodo == "Bootstrap" and len(rets) > 20:
-        base = rets - rets.mean()
-        lr = rng.choice(base, size=(n, dias)).astype(np.float32) + np.float32(mu * dt)
-    else:
-        z = rng.standard_normal((n, dias), dtype=np.float32)
-        lr = np.float32((mu - 0.5 * sigma ** 2) * dt) + np.float32(sigma * math.sqrt(dt)) * z
-    return (S0 * np.exp(np.cumsum(lr, axis=1))).astype(np.float32)
-
-def max_pain(f):
-    """Strike em que o total pago aos titulares das opções seria mínimo (aproximação)."""
-    ks = np.sort(f.strike.unique())
-    if len(ks) == 0:
-        return None
-    c = f[f.tipo == "CALL"].groupby("strike").contratos.sum()
-    p = f[f.tipo == "PUT"].groupby("strike").contratos.sum()
-    custo = [(c * np.maximum(P - c.index, 0)).sum() + (p * np.maximum(p.index - P, 0)).sum()
-             for P in ks]
-    return float(ks[int(np.argmin(custo))])
 
 with aba_q:
     st.caption("Ferramentas estatísticas para estudo. Não são recomendação de investimento: "
