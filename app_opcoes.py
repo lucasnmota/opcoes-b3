@@ -766,6 +766,67 @@ def iv_atm(c_v, S):
     w = np.exp(-((x.strike / S - 1) / 0.03) ** 2) * np.sqrt(x.negocios + 1)
     return float((w * x.IV).sum() / w.sum() / 100) if w.sum() > 0 else None
 
+# ---------- Indicadores econômicos e rentabilidade ----------
+RESERVA_IND = {"Selic": 13.75, "CDI": 13.65, "IPCA 12m": 4.58, "Poupança": 6.17,
+               "_ref": "set/2026"}
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def indicadores_bcb():
+    """Selic meta, CDI, IPCA 12 meses e poupança pelo Banco Central (SGS)."""
+    def serie(cod, n=1):
+        url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{cod}/dados/ultimos/{n}?formato=json"
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        d = r.json()
+        return [(x["data"], float(str(x["valor"]).replace(",", "."))) for x in d]
+    out, ok = dict(RESERVA_IND), []
+    for nome, cod in [("Selic", 432), ("CDI", 4389), ("IPCA 12m", 13522)]:
+        try:
+            dt, v = serie(cod)[-1]
+            out[nome] = v
+            out[f"_{nome}"] = dt
+            ok.append(nome)
+        except Exception:
+            pass
+    try:
+        meses = serie(195, 12)
+        if len(meses) == 12:
+            out["Poupança"] = (np.prod([1 + v / 100 for _, v in meses]) - 1) * 100
+            ok.append("Poupança")
+    except Exception:
+        pass
+    out["_fonte"] = "Banco Central (SGS)" if ok else f"valores de referência ({RESERVA_IND['_ref']})"
+    return out
+
+def ir_renda_fixa(dias_corridos):
+    if dias_corridos <= 180:
+        return 0.225
+    if dias_corridos <= 360:
+        return 0.20
+    if dias_corridos <= 720:
+        return 0.175
+    return 0.15
+
+def extremos(pernas, S0):
+    ks = pernas.Strike[pernas.Strike > 0].to_numpy()
+    kmax = max(ks.max() if len(ks) else S0, S0)
+    nos = np.unique(np.concatenate([[1e-6], ks, [S0, kmax * 3, kmax * 6]]))
+    v = resultado(nos, pernas)
+    inc = v[-1] - v[-2]
+    lm = np.inf if inc > 1e-6 else float(v.max())
+    pm = -np.inf if inc < -1e-6 else float(v.min())
+    return lm, pm
+
+def capital_estimado(pernas, S0):
+    """Capital comprometido: débito pago, ou a margem aproximada (perda máxima)."""
+    custo = float((sinal(pernas) * pernas.Qtd * pernas.Prêmio).sum())
+    _, pm = extremos(pernas, S0)
+    if np.isfinite(pm):
+        return max(custo, -pm, 1.0), "perda máxima / débito"
+    vend = pernas[(sinal(pernas) < 0) & (pernas.Tipo != "AÇÃO")]
+    notional = float((vend.Strike.where(vend.Strike > 0, S0) * vend.Qtd).sum())
+    return max(custo, 0.20 * notional, 1.0), "margem estimada (20% do nocional vendido)"
+
 # ---------- Barra lateral ----------
 st.sidebar.title("📈 Opções B3")
 meses = st.sidebar.slider("Meses de histórico", 1, 6, 3,
@@ -1412,6 +1473,152 @@ with aba_sim:
         st.caption("Linha azul: resultado no vencimento. Linha tracejada: resultado teórico hoje, "
                    "pela volatilidade e prazo informados. Opções de ações na B3 são americanas; "
                    "o modelo é uma aproximação.")
+
+
+        # ===== Rentabilidade x capital e indicadores econômicos =====
+        st.markdown("**💰 Rentabilidade sobre o capital e comparação com indicadores**")
+        ind = indicadores_bcb()
+        du_r = int(max(dias, 1))
+        dc_r = max(int(round(du_r * 365 / 252)), 1)
+        cap_est, cap_txt = capital_estimado(pernas, S0)
+        r1, r2, r3, r4 = st.columns([1.3, 1, 1, 1.2])
+        capital = r1.number_input("Capital investido (R$)", 1.0, 1e10, round(cap_est, 2), 100.0,
+                                  key=f"cap_{st.session_state.ed_v}_{round(cap_est, 2)}",
+                                  help=f"Estimativa: {cap_txt}. Ajuste com a margem real exigida "
+                                       "pela sua corretora, se for diferente.")
+        custos_op = r2.number_input("Custos (R$)", 0.0, 1e7, 0.0, 5.0, key="rent_custos",
+                                    help="Corretagem, emolumentos e taxas da operação completa.")
+        r3.write("")
+        com_ir = r3.toggle("Descontar IR", value=True, key="rent_ir",
+                           help="Opções: 15% sobre o lucro (swing trade). Renda fixa: tabela "
+                                "regressiva pelo prazo. Poupança: isenta.")
+        r4.write("")
+        r4.caption(f"Prazo: {du_r} dias úteis (~{dc_r} corridos) • indicadores: {ind['_fonte']}")
+
+        with st.expander("Ajustar indicadores"):
+            i1, i2, i3, i4 = st.columns(4)
+            cdi_a = i1.number_input("CDI (% a.a.)", 0.0, 100.0, float(round(ind["CDI"], 2)), 0.05,
+                                    key="ind_cdi") / 100
+            selic_a = i2.number_input("Selic (% a.a.)", 0.0, 100.0, float(round(ind["Selic"], 2)),
+                                      0.05, key="ind_selic") / 100
+            ipca_a = i3.number_input("IPCA 12 meses (%)", -10.0, 100.0,
+                                     float(round(ind["IPCA 12m"], 2)), 0.05, key="ind_ipca") / 100
+            poup_a = i4.number_input("Poupança (% a.a.)", 0.0, 100.0,
+                                     float(round(ind["Poupança"], 2)), 0.05, key="ind_poup") / 100
+
+        per_ = lambda taxa: (1 + taxa) ** (du_r / 252) - 1
+        anual = lambda ret: ((1 + ret) ** (252 / du_r) - 1) if ret > -1 else -1.0
+        ir_rf = ir_renda_fixa(dc_r) if com_ir else 0.0
+        cdi_p, selic_p = per_(cdi_a) * (1 - ir_rf), per_(selic_a) * (1 - ir_rf)
+        poup_p, ipca_p = per_(poup_a), per_(ipca_a)
+
+        def liquido(v):
+            v = v - custos_op
+            return v * (1 - 0.15) if (com_ir and v > 0) else v
+
+        # Distribuição do resultado no vencimento (log-normal com a vol do simulador)
+        xg, mg = _massas(S0, max(T, 1 / 252), r_cont, vol)
+        pg = resultado(xg, pernas)
+        ordem_g = np.argsort(pg)
+        acum_g = np.cumsum(mg[ordem_g])
+        pct_ = lambda p: float(pg[ordem_g][min(np.searchsorted(acum_g, p), len(pg) - 1)])
+        lm_n, pm_n = extremos(pernas, S0)
+        cen = [
+            ("🏆 Melhor cenário", lm_n if np.isfinite(lm_n) else pct_(0.95),
+             "lucro máximo da estrutura" if np.isfinite(lm_n) else "ganho ilimitado: usando o "
+             "melhor 5% dos cenários"),
+            ("📊 Valor esperado", float(pg @ mg), "média ponderada pela probabilidade"),
+            ("➖ Preço parado", float(resultado([S0], pernas)[0]), f"ativo fecha em R$ {num(S0)}"),
+            ("⚠️ Pior cenário", pm_n if np.isfinite(pm_n) else pct_(0.05),
+             "prejuízo máximo" if np.isfinite(pm_n) else "perda ilimitada: usando o pior 5%"),
+        ]
+        linhas_r = []
+        for nome_c, bruto, obs in cen:
+            liq = liquido(bruto)
+            ret = liq / capital
+            linhas_r.append({
+                "Cenário": nome_c, "Resultado líquido (R$)": liq,
+                "Retorno no período": ret * 100, "Retorno anualizado": anual(ret) * 100,
+                "% do CDI": (ret / cdi_p * 100) if cdi_p > 0 else None,
+                "Ganho real (acima do IPCA)": ((1 + ret) / (1 + ipca_p) - 1) * 100,
+                "Diferença p/ CDI (R$)": liq - capital * cdi_p, "Observação": obs})
+        tab_r = pd.DataFrame(linhas_r)
+        melhor = linhas_r[0]
+
+        def txt_anual(v):
+            return "> 1.000%" if v > 1000 else f"{num(v, 1)}%"
+        def txt_cdi(v):
+            if v is None or v <= 0:
+                return "–"
+            return f"{num(v / 100, 1)}x o CDI" if v >= 200 else f"{num(v, 0)}% do CDI"
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Melhor cenário no período", f"{num(melhor['Retorno no período'], 2)}%",
+                  f"{txt_anual(melhor['Retorno anualizado'])} ao ano"
+                  if melhor["Retorno anualizado"] > -100 else None)
+        k2.metric("Em relação ao CDI", txt_cdi(melhor["% do CDI"]),
+                  f"CDI no período: {num(cdi_p * 100, 2)}%", delta_color="off")
+        k3.metric("Ganho real (descontada a inflação)",
+                  f"{num(melhor['Ganho real (acima do IPCA)'], 2)}%",
+                  f"IPCA no período: {num(ipca_p * 100, 2)}%", delta_color="off")
+        alvo_cdi = capital * cdi_p
+        pnet = np.array([liquido(v) for v in pg])
+        prob_cdi = float(mg[pnet > alvo_cdi].sum() * 100)
+        k4.metric("Chance de superar o CDI", f"{num(prob_cdi, 0)}%",
+                  help="Probabilidade estimada de o resultado líquido no vencimento ser maior "
+                       "que o que o mesmo capital renderia no CDI.")
+
+        tab_vis = tab_r.copy()
+        tab_vis["Retorno anualizado"] = tab_vis["Retorno anualizado"].map(txt_anual)
+        tab_vis["% do CDI"] = tab_vis["% do CDI"].map(txt_cdi)
+        tab_vis = tab_vis.rename(columns={"% do CDI": "Comparado ao CDI"})
+        st.dataframe(tab_vis, width="stretch", hide_index=True, column_config={
+            "Resultado líquido (R$)": st.column_config.NumberColumn(format="localized"),
+            "Retorno no período": st.column_config.NumberColumn(format="%.2f%%"),
+            "Ganho real (acima do IPCA)": st.column_config.NumberColumn(format="%.2f%%"),
+            "Diferença p/ CDI (R$)": st.column_config.NumberColumn(format="localized")})
+
+        comp = pd.DataFrame([
+            ("🏆 Estratégia – melhor cenário", melhor["Retorno anualizado"], "#16a34a"),
+            ("📊 Estratégia – valor esperado", linhas_r[1]["Retorno anualizado"], "#2563eb"),
+            (f"CDI{' líquido' if com_ir else ''}", anual(cdi_p) * 100, "#64748b"),
+            (f"Selic / Tesouro Selic{' líquido' if com_ir else ''}", anual(selic_p) * 100, "#94a3b8"),
+            ("Poupança (isenta)", poup_a * 100, "#cbd5e1"),
+            ("Inflação (IPCA 12m)", ipca_a * 100, "#f59e0b")],
+            columns=["Investimento", "Retorno anualizado (%)", "cor"])
+        comp["Retorno anualizado (%)"] = comp["Retorno anualizado (%)"].clip(-100, 1000)
+        fcomp = go.Figure(go.Bar(
+            y=comp.Investimento, x=comp["Retorno anualizado (%)"], orientation="h",
+            marker_color=comp.cor, text=[txt_anual(v) for v in comp["Retorno anualizado (%)"]],
+            textposition="outside", cliponaxis=False))
+        fcomp.update_layout(title="Retorno anualizado comparado (escala limitada a 1.000%)",
+                            xaxis_title="% ao ano", yaxis=dict(autorange="reversed"),
+                            showlegend=False, xaxis_tickformat=".0f")
+        grafico(st, fcomp, 380, key="rent_comp")
+
+        # Preço necessário no vencimento pra empatar com o CDI
+        grade_be = np.linspace(S0 * 0.5, S0 * 1.5, 2001)
+        dif = np.array([liquido(v) for v in resultado(grade_be, pernas)]) - alvo_cdi
+        empates = breakevens(grade_be, dif)
+        frases = []
+        if melhor["% do CDI"] is not None and melhor["% do CDI"] > 100:
+            frases.append(f"No melhor cenário, a estratégia rende **{num(melhor['% do CDI'] / 100, 1)}x "
+                          f"o CDI** no mesmo prazo ({brl(melhor['Diferença p/ CDI (R$)'], 2)} a mais "
+                          "que deixar o capital aplicado).")
+        elif melhor["% do CDI"] is not None:
+            frases.append("⚠️ Mesmo no melhor cenário, a estratégia **não supera o CDI** no prazo. "
+                          "Vale reavaliar: o risco não está sendo bem pago.")
+        if empates:
+            frases.append("Pra empatar com o CDI, o ativo precisa fechar o vencimento em "
+                          + " ou ".join(f"**R$ {num(e)}**" for e in empates)
+                          + " (acima ou abaixo disso, conforme o formato do payoff).")
+        for f_ in frases:
+            st.markdown(f_)
+        st.caption(f"Retornos sobre o capital de {brl(capital, 2)}, no prazo de {du_r} dias úteis, "
+                   "com anualização em base 252. "
+                   + (f"IR: 15% sobre o lucro da estratégia; {ir_rf * 100:.1f}% na renda fixa pelo "
+                      "prazo; poupança isenta. " if com_ir else "Valores brutos de IR. ")
+                   + "Probabilidades pela volatilidade do simulador. Não considera imposto sobre "
+                     "proventos nem custo de oportunidade da margem depositada.")
 
         s1, s2, s3 = st.columns([2, 1, 1])
         nome_est = s1.text_input("Nome da estratégia", f"{preset} {ticker}")
