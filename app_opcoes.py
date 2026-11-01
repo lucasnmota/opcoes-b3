@@ -124,6 +124,51 @@ def ncdf(x):
              + 0.254829592) * t * np.exp(-z * z)
     return 0.5 * (1 + np.sign(x) * y)
 
+def bs_vec(S, K, T, r, vol, call):
+    """Black-Scholes vetorizado. Devolve (preço, d1)."""
+    raiz = vol * np.sqrt(T)
+    d1 = (np.log(S / K) + (r + vol ** 2 / 2) * T) / raiz
+    d2 = d1 - raiz
+    desc = np.exp(-r * T)
+    c = S * ncdf(d1) - K * desc * ncdf(d2)
+    p = K * desc * ncdf(-d2) - S * ncdf(-d1)
+    return np.where(call, c, p), d1
+
+def iv_vec(preco, S, K, T, r, call, it=50):
+    """Volatilidade implícita por bisseção, para milhares de opções de uma vez."""
+    n = len(preco)
+    lo, hi = np.full(n, 0.01), np.full(n, 3.0)
+    for _ in range(it):
+        mid = (lo + hi) / 2
+        alto = bs_vec(S, K, T, r, mid, call)[0] > preco
+        hi, lo = np.where(alto, mid, hi), np.where(alto, lo, mid)
+    vmin = bs_vec(S, K, T, r, np.full(n, 0.011), call)[0]
+    vmax = bs_vec(S, K, T, r, np.full(n, 2.99), call)[0]
+    return np.where((preco > vmin) & (preco < vmax), (lo + hi) / 2, np.nan)
+
+def gregas(S, K, T, r, vol, call):
+    """Delta, gama, theta (R$/dia), vega (R$ por 1 ponto de vol) e prob. de terminar ITM."""
+    S, K, T, vol = (np.asarray(x, float) for x in (S, K, T, vol))
+    T = np.maximum(T, 1 / 252)
+    raiz = vol * np.sqrt(T)
+    d1 = (np.log(S / K) + (r + vol ** 2 / 2) * T) / raiz
+    d2 = d1 - raiz
+    pdf = np.exp(-d1 ** 2 / 2) / math.sqrt(2 * math.pi)
+    desc = np.exp(-r * T)
+    delta = np.where(call, ncdf(d1), ncdf(d1) - 1)
+    gama = pdf / (S * raiz)
+    theta_c = -S * pdf * vol / (2 * np.sqrt(T)) - r * K * desc * ncdf(d2)
+    theta_p = -S * pdf * vol / (2 * np.sqrt(T)) + r * K * desc * ncdf(-d2)
+    theta = np.where(call, theta_c, theta_p) / 252
+    vega = S * pdf * np.sqrt(T) / 100
+    prob_itm = np.where(call, ncdf(d2), ncdf(-d2))
+    return delta, gama, theta, vega, prob_itm
+
+def moneyness(tipo, K, S, tol):
+    rel = np.asarray(K, float) / S - 1
+    call = np.asarray(tipo) == "CALL"
+    return np.where(np.abs(rel) <= tol, "ATM", np.where((rel < 0) == call, "ITM", "OTM"))
+
 def bs(S, K, T, r, vol, tipo):
     """Preço teórico Black-Scholes (aproximação europeia)."""
     S = np.asarray(S, float)
@@ -719,36 +764,119 @@ with aba_sim:
         })
     pernas = limpar(editado)
 
-    with st.expander("➕ Adicionar opção real (último pregão)"):
-        hoje_a = df[(df.data == ultimo) & (df.ativo == ativo)]
-        vv = sorted(hoje_a.vencimento.dropna().unique())
-        if not vv:
+    @st.cache_data(show_spinner=False)
+    def cadeia(versao, raiz, tk, S, r, vol_pad):
+        """Opções do último pregão com IV e gregas."""
+        h = df[(df.data == ultimo) & (df.ativo == raiz)]
+        if h.empty:
+            return h
+        c = (h.dropna(subset=["vencimento"])
+              .groupby(["codigo", "tipo", "strike", "vencimento"], as_index=False)
+              .agg(fechamento=("fechamento", "last"), volume=("volume", "sum"),
+                   negocios=("negocios", "sum")))
+        c = c[(c.strike > 0) & (c.fechamento > 0)].copy()
+        sp = acoes[(acoes.codigo == tk) & (acoes.data == ultimo)].fechamento
+        S_fech = float(sp.iloc[0]) if len(sp) else S
+        du_fech = np.busday_count(np.datetime64(ultimo.date()),
+                                  c.vencimento.values.astype("datetime64[D]"))
+        du_hoje = np.busday_count(np.datetime64(date.today()),
+                                  c.vencimento.values.astype("datetime64[D]"))
+        call = (c.tipo == "CALL").to_numpy()
+        T_fech = np.maximum(du_fech, 1) / 252
+        c["IV"] = iv_vec(c.fechamento.to_numpy(), np.full(len(c), S_fech),
+                         c.strike.to_numpy(), T_fech, r, call)
+        vol_use = np.where(np.isnan(c.IV), vol_pad, c.IV)
+        c["Dias úteis"] = np.maximum(du_hoje, 0)
+        d, g, t, v, p = gregas(np.full(len(c), S), c.strike.to_numpy(),
+                               np.maximum(du_hoje, 1) / 252, r, vol_use, call)
+        c["Delta"], c["Gama"], c["Theta"], c["Vega"], c["Prob. ITM"] = d, g, t, v, p * 100
+        c["|Delta|"] = np.abs(d)
+        c["IV"] = c.IV * 100
+        return c
+
+    with st.expander("➕ Adicionar opção real (último pregão)", expanded=True):
+        ch = cadeia(os.path.getmtime(HIST), ativo, ticker, round(S0, 2), round(r_cont, 6),
+                    round(vol, 4))
+        if ch.empty:
             st.caption("Esse ativo não teve opções negociadas no último pregão.")
         else:
-            e1, e2, e3, e4, e5 = st.columns([1.2, 2.6, 1, 1, 1])
-            vsel = e1.selectbox("Vencimento", vv, key="add_v",
+            vv = sorted(ch.vencimento.unique())
+            futuros = [x for x in vv if x >= pd.Timestamp(date.today())]
+            f1, f2, f3, f4 = st.columns([1.3, 1.2, 1.8, 1.2])
+            vsel = f1.selectbox("Vencimento", vv, key="add_v",
+                                index=vv.index(futuros[0]) if futuros else 0,
                                 format_func=lambda x: pd.Timestamp(x).strftime("%d/%m/%Y"))
-            ops = (hoje_a[hoje_a.vencimento == vsel]
-                   .groupby(["codigo", "tipo", "strike"], as_index=False)
-                   .agg(fechamento=("fechamento", "last"), volume=("volume", "sum"))
-                   .sort_values(["tipo", "strike"]).reset_index(drop=True))
-            i_op = e2.selectbox("Opção", range(len(ops)), key="add_o",
-                                format_func=lambda i: f"{ops.codigo[i]} · {ops.tipo[i]} · "
-                                                      f"strike {num(ops.strike[i])} · "
-                                                      f"R$ {num(ops.fechamento[i])}")
-            op = e3.selectbox("Operação", ["Compra", "Venda"], key="add_op")
-            qq = e4.number_input("Quantidade", 1, 10_000_000, int(qtd_pad), 100, key="add_q")
-            e5.write("")
-            if e5.button("Adicionar", width="stretch"):
-                o = ops.iloc[i_op]
-                nova = pd.DataFrame([{"Operação": op, "Tipo": o.tipo, "Código": o.codigo,
-                                      "Strike": o.strike, "Prêmio": o.fechamento, "Qtd": float(qq)}])
-                st.session_state.pernas = limpar(pd.concat([pernas, nova], ignore_index=True))
+            tipo_sel = f2.segmented_control("Tipo", ["CALL", "PUT"], default="CALL",
+                                            key="add_tipo") or "CALL"
+            mon_sel = f3.segmented_control("Moneyness", ["ITM", "ATM", "OTM"],
+                                           selection_mode="multi",
+                                           default=["ITM", "ATM", "OTM"], key="add_mon") or []
+            tol = f4.number_input("Faixa ATM (±%)", 0.5, 10.0, 2.0, 0.5, key="add_tol",
+                                  help="Strikes a até essa distância da cotação contam como ATM.") / 100
+            g1, g2 = st.columns([2, 1])
+            dmin, dmax = g1.slider("Delta (em módulo)", 0.0, 1.0, (0.0, 1.0), 0.05,
+                                   key="add_delta",
+                                   help="Ex.: 0,20 a 0,35 pra opções OTM típicas de venda; "
+                                        "perto de 0,50 é o ATM.")
+            so_liq = g2.toggle("Só com 5+ negócios", value=False, key="add_liq")
+
+            c = ch[(ch.vencimento == vsel) & (ch.tipo == tipo_sel)].copy()
+            c["Moneyness"] = moneyness(c.tipo, c.strike, S0, tol)
+            c["Distância (%)"] = (c.strike / S0 - 1) * 100
+            c = c[c.Moneyness.isin(mon_sel) & c["|Delta|"].between(dmin, dmax)]
+            if so_liq:
+                c = c[c.negocios >= 5]
+            c = c.sort_values("strike").reset_index(drop=True)
+
+            cor = "🟢" if tipo_sel == "CALL" else "🔴"
+            st.caption(f"{cor} {len(c)} {tipo_sel}s • cotação de referência R$ {num(S0)} • "
+                       f"{int(c['Dias úteis'].iloc[0]) if len(c) else '–'} dias úteis até o "
+                       f"vencimento • selecione uma ou mais linhas na tabela")
+            vis = c[["codigo", "Moneyness", "strike", "Distância (%)", "fechamento", "Delta",
+                     "|Delta|", "Gama", "Theta", "Vega", "IV", "Prob. ITM", "negocios", "volume"]]
+            sel = st.dataframe(
+                vis, width="stretch", hide_index=True, key=f"tab_cadeia_{tipo_sel}_{st.session_state.ed_v}",
+                on_select="rerun", selection_mode="multi-row", height=380,
+                column_config={
+                    "codigo": st.column_config.TextColumn("Opção"),
+                    "strike": st.column_config.NumberColumn("Strike", format="%.2f"),
+                    "Distância (%)": st.column_config.NumberColumn(format="%+.1f%%"),
+                    "fechamento": st.column_config.NumberColumn("Prêmio", format="%.2f"),
+                    "Delta": st.column_config.NumberColumn(format="%.2f"),
+                    "|Delta|": st.column_config.ProgressColumn(
+                        "Delta (barra)", min_value=0.0, max_value=1.0, format="%.2f"),
+                    "Gama": st.column_config.NumberColumn(format="%.3f"),
+                    "Theta": st.column_config.NumberColumn("Theta (R$/dia)", format="%.3f"),
+                    "Vega": st.column_config.NumberColumn("Vega (R$/1%)", format="%.3f"),
+                    "IV": st.column_config.NumberColumn("IV", format="%.1f%%"),
+                    "Prob. ITM": st.column_config.NumberColumn(format="%.0f%%"),
+                    "negocios": st.column_config.NumberColumn("Negócios", format="localized"),
+                    "volume": st.column_config.NumberColumn("Volume (R$)", format="compact")})
+            linhas_sel = []
+            try:
+                linhas_sel = list(sel.selection.rows)
+            except Exception:
+                pass
+
+            a1, a2, a3 = st.columns([1, 1, 1.4])
+            op = a1.segmented_control("Operação", ["Compra", "Venda"], default="Compra",
+                                      key="add_op") or "Compra"
+            qq = a2.number_input("Quantidade", 1, 10_000_000, int(qtd_pad), 100, key="add_q")
+            a3.write("")
+            rotulo = (f"Adicionar {len(linhas_sel)} selecionada(s)" if linhas_sel
+                      else "Selecione na tabela")
+            if a3.button(rotulo, width="stretch", disabled=not linhas_sel, type="primary"):
+                esc = c.iloc[linhas_sel]
+                novas = pd.DataFrame({"Operação": op, "Tipo": esc.tipo.values,
+                                      "Código": esc.codigo.values, "Strike": esc.strike.values,
+                                      "Prêmio": esc.fechamento.values, "Qtd": float(qq)})
+                st.session_state.pernas = limpar(pd.concat([pernas, novas], ignore_index=True))
                 st.session_state.ed_v += 1
                 st.rerun()
-            st.caption(f"Preços do fechamento de {ultimo:%d/%m/%Y}. Faltam "
-                       f"{np.busday_count(date.today(), pd.Timestamp(vsel).date())} dias úteis "
-                       "para esse vencimento.")
+            st.caption("Prêmios e IV do fechamento de "
+                       f"{ultimo:%d/%m/%Y}. Gregas recalculadas com a cotação de referência e "
+                       "o prazo de hoje, usando a IV de cada opção. Delta de call vai de 0 a 1 e "
+                       "de put de -1 a 0; em módulo, aproxima a chance de terminar dentro do dinheiro.")
 
     st.markdown("##### 4. Resultado")
     if pernas.empty:
@@ -760,6 +888,37 @@ with aba_sim:
         m2.metric("Lucro máximo", lmax)
         m3.metric("Prejuízo máximo", pmax)
         m4.metric("Break-even", " / ".join(f"R$ {num(b)}" for b in bes) if bes else "–")
+        # Gregas da posição: IV de mercado quando a perna tem código, senão a vol informada
+        iv_map = (ch.set_index("codigo")["IV"] / 100).to_dict() if not ch.empty else {}
+        opc_p = pernas[pernas.Tipo != "AÇÃO"]
+        sg_all = sinal(pernas)
+        delta_pos = float((sg_all * pernas.Qtd)[(pernas.Tipo == "AÇÃO").to_numpy()].sum())
+        gama_pos = theta_pos = vega_pos = 0.0
+        if not opc_p.empty:
+            vol_p = opc_p["Código"].map(iv_map).astype(float).fillna(vol).to_numpy()
+            dg, gg, tg, vg, _ = gregas(np.full(len(opc_p), S0), opc_p.Strike.to_numpy(),
+                                       np.full(len(opc_p), max(T, 1 / 252)), r_cont, vol_p,
+                                       (opc_p.Tipo == "CALL").to_numpy())
+            mult = sinal(opc_p) * opc_p.Qtd.to_numpy()
+            delta_pos += float((mult * dg).sum())
+            gama_pos, theta_pos, vega_pos = (float((mult * x).sum()) for x in (gg, tg, vg))
+        st.markdown("**Gregas da posição**")
+        n1, n2, n3, n4 = st.columns(4)
+        n1.metric("Delta (ações equivalentes)", num(delta_pos, 0),
+                  help="Quantas ações a posição 'vale' agora. Positivo ganha na alta, "
+                       "negativo ganha na queda.")
+        n2.metric("Exposição em R$ (delta × preço)", brl(delta_pos * S0, 0))
+        n3.metric("Theta (R$ por dia)", brl(theta_pos, 2),
+                  help="Quanto a posição ganha (+) ou perde (−) por dia só com a passagem do tempo.")
+        n4.metric("Vega (R$ por 1 ponto de vol)", brl(vega_pos, 2),
+                  help=f"Gama: {num(gama_pos, 2)} ações de delta por R$ 1 de movimento.")
+        if abs(delta_pos) < 0.1 * max(pernas.Qtd.max(), 1):
+            st.caption("Posição praticamente **delta neutra**: o resultado depende mais de "
+                       "tempo e volatilidade do que da direção.")
+        else:
+            st.caption(f"Posição **{'comprada' if delta_pos > 0 else 'vendida'} em delta**: a "
+                       f"cada R$ 1 de {'alta' if delta_pos > 0 else 'queda'} do ativo, ganha "
+                       f"cerca de {brl(abs(delta_pos), 0)}.")
         grafico(st, grafico_payoff(pernas, S0, T, r_cont, vol), 480)
         st.caption("Linha azul: resultado no vencimento. Linha tracejada: resultado teórico hoje, "
                    "pela volatilidade e prazo informados. Opções de ações na B3 são americanas; "
@@ -856,28 +1015,6 @@ with aba_acomp:
                     st.rerun()
 
 # ---------- Análises quantitativas ----------
-def bs_vec(S, K, T, r, vol, call):
-    """Black-Scholes vetorizado. Devolve (preço, d1)."""
-    raiz = vol * np.sqrt(T)
-    d1 = (np.log(S / K) + (r + vol ** 2 / 2) * T) / raiz
-    d2 = d1 - raiz
-    desc = np.exp(-r * T)
-    c = S * ncdf(d1) - K * desc * ncdf(d2)
-    p = K * desc * ncdf(-d2) - S * ncdf(-d1)
-    return np.where(call, c, p), d1
-
-def iv_vec(preco, S, K, T, r, call, it=50):
-    """Volatilidade implícita por bisseção, para milhares de opções de uma vez."""
-    n = len(preco)
-    lo, hi = np.full(n, 0.01), np.full(n, 3.0)
-    for _ in range(it):
-        mid = (lo + hi) / 2
-        alto = bs_vec(S, K, T, r, mid, call)[0] > preco
-        hi, lo = np.where(alto, mid, hi), np.where(alto, lo, mid)
-    vmin = bs_vec(S, K, T, r, np.full(n, 0.011), call)[0]
-    vmax = bs_vec(S, K, T, r, np.full(n, 2.99), call)[0]
-    return np.where((preco > vmin) & (preco < vmax), (lo + hi) / 2, np.nan)
-
 @st.cache_data(show_spinner="Calculando volatilidade implícita...")
 def base_quant(versao, raiz, tk, r):
     sp = acoes[acoes.codigo == tk][["data", "fechamento"]].rename(columns={"fechamento": "spot"})
